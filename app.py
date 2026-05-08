@@ -109,14 +109,17 @@ with ctrl_col:
         progress = st.progress(0, "Connecting to OpenStreetMap…")
         error_occurred = False
 
+        # Multiple Overpass endpoints — tried in order if one fails (e.g. 406)
+        OVERPASS_ENDPOINTS = [
+            "https://overpass.kumi.systems/api/interpreter",
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+            "https://overpass-api.de/api/interpreter",
+        ]
+
         try:
             # Polygon bounds → Overpass bbox (south, west, north, east)
             minx, miny, maxx, maxy = polygon.bounds
             s, w, n, e = miny, minx, maxy, maxx
-
-            # ── Buildings via Overpass API ─────────────────────────────────
-            progress.progress(15, "Fetching residential buildings…")
-            api = overpy.Overpass()
 
             query = f"""
 [out:json][timeout:60];
@@ -126,7 +129,25 @@ with ctrl_col:
 );
 out center;
 """
-            result = api.query(query)
+            # ── Buildings via Overpass API (with endpoint fallback) ────────
+            progress.progress(15, "Fetching residential buildings…")
+            result = None
+            last_error = None
+
+            for endpoint in OVERPASS_ENDPOINTS:
+                try:
+                    api = overpy.Overpass(url=endpoint)
+                    result = api.query(query)
+                    break  # success — stop trying other endpoints
+                except Exception as endpoint_err:
+                    last_error = endpoint_err
+                    continue  # try next endpoint
+
+            if result is None:
+                raise Exception(
+                    f"All Overpass endpoints failed. Last error: {last_error}"
+                )
+
             progress.progress(45, "Processing buildings…")
 
             buildings = []
@@ -173,9 +194,6 @@ out center;
 
             progress.progress(100, f"Done! Found {len(buildings)} buildings.")
 
-        except overpy.exception.DataWrongType as e:
-            st.error(f"Overpass API error: {e}. Try a smaller area.")
-            error_occurred = True
         except Exception as e:
             st.error(f"Error fetching data: {e}")
             error_occurred = True
