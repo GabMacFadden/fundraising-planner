@@ -1,8 +1,10 @@
 """
 Fundraising Route Planner — Phase 1
-Area selection · house detection · walkable street network.
+Area selection · house detection · walkable street display.
 
-Performance & safety notes inline.
+Phase 1 uses a single direct Overpass query for everything (buildings,
+addresses, walkable streets). Streamlit reruns are confined to user
+*actions* — pan/zoom never trigger them.
 """
 
 import math
@@ -11,7 +13,6 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 from folium.plugins import Draw, MeasureControl, FastMarkerCluster
-import osmnx as ox
 from shapely.geometry import shape, Point
 from shapely import wkt as shapely_wkt
 
@@ -27,21 +28,25 @@ st.set_page_config(
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Overpass mirrors. We try them in order. Putting kumi.systems first because
-# it's typically more permissive for cloud-hosted clients.
 OVERPASS_MIRRORS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass-api.de/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
-# A descriptive User-Agent is REQUIRED by Overpass usage policy. Without it,
-# servers may return HTTP 406, 429 or block requests outright.
+# Required by Overpass usage policy. Without it, mirrors return 406/429.
 USER_AGENT = "FundraisingRoutePlanner/1.0 (https://streamlit.io)"
 
-# Hard cap on selectable area to prevent abuse, runaway queries and OOM.
+# Hard cap on selectable area to prevent abuse and timeouts
 MAX_AREA_KM2 = 4.0
-REQUEST_TIMEOUT = 60       # seconds
+REQUEST_TIMEOUT = 60     # seconds
+
+# Walkable street types (excludes motorways/trunks where pedestrians don't go)
+WALKABLE_HIGHWAYS = (
+    "footway|path|pedestrian|residential|living_street|service|"
+    "tertiary|tertiary_link|secondary|secondary_link|primary|"
+    "primary_link|unclassified|cycleway|steps"
+)
 
 BUILDING_LABELS = {
     "yes":                "Generic building",
@@ -60,29 +65,32 @@ BUILDING_LABELS = {
 }
 
 HIGHWAY_COLORS = {
-    "primary":       "#e74c3c",
-    "secondary":     "#e67e22",
-    "tertiary":      "#f39c12",
-    "residential":   "#2980b9",
-    "living_street": "#8e44ad",
-    "footway":       "#27ae60",
-    "path":          "#27ae60",
-    "pedestrian":    "#1abc9c",
-    "service":       "#95a5a6",
-    "track":         "#7f8c8d",
+    "primary":         "#e74c3c",
+    "primary_link":    "#e74c3c",
+    "secondary":       "#e67e22",
+    "secondary_link":  "#e67e22",
+    "tertiary":        "#f39c12",
+    "tertiary_link":   "#f39c12",
+    "residential":     "#2980b9",
+    "unclassified":    "#2980b9",
+    "living_street":   "#8e44ad",
+    "footway":         "#27ae60",
+    "path":            "#27ae60",
+    "steps":           "#16a085",
+    "pedestrian":      "#1abc9c",
+    "cycleway":        "#9b59b6",
+    "service":         "#95a5a6",
 }
 DEFAULT_HIGHWAY_COLOR = "#2980b9"
 
 DEFAULTS = {
-    "buildings":             [],
-    "edges_geojson":         None,
-    "polygon":               None,
-    "map_center":            [59.9139, 10.7522],   # Oslo
-    "map_zoom":              14,
-    "fetch_done":            False,
-    "map_key":               0,
-    "selected_types":        [],
-    "reset_polygon_wkt":     None,                 # used to ignore stale drawings
+    "buildings":         [],
+    "streets_geojson":   None,
+    "polygon":           None,
+    "fetch_done":        False,
+    "map_key":           0,
+    "selected_types":    [],
+    "reset_polygon_wkt": None,
 }
 
 
@@ -95,7 +103,7 @@ def label(raw: str) -> str:
 
 
 def approximate_area_km2(polygon) -> float:
-    """Latitude-corrected area in km² (much better than the flat-Earth estimate)."""
+    """Latitude-corrected area in km²."""
     if polygon is None:
         return 0.0
     centroid = polygon.centroid
@@ -105,29 +113,27 @@ def approximate_area_km2(polygon) -> float:
 
 
 def overpass_query(polygon) -> str:
-    """One combined query for buildings + address nodes (much faster than two)."""
+    """ONE combined query for buildings, addresses and walkable streets."""
     minx, miny, maxx, maxy = polygon.bounds
-    # Overpass bbox = south, west, north, east
     s, w, n, e = miny, minx, maxy, maxx
     return f"""
 [out:json][timeout:{REQUEST_TIMEOUT}];
 (
   way["building"]({s},{w},{n},{e});
   node["addr:housenumber"]({s},{w},{n},{e});
+  way["highway"~"^({WALKABLE_HIGHWAYS})$"]({s},{w},{n},{e});
 );
-out center tags;
+out geom tags;
 """.strip()
 
 
 def fetch_overpass(polygon):
-    """Try each mirror until one returns 200. Returns (data, used_url, err)."""
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-    }
+    """Try mirrors in order. Returns (data_dict, used_url, err_str)."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     query = overpass_query(polygon)
     last_err = None
     for url in OVERPASS_MIRRORS:
+        host = url.split("/")[2]
         try:
             r = requests.post(
                 url,
@@ -137,116 +143,101 @@ def fetch_overpass(polygon):
             )
             if r.status_code == 200:
                 return r.json(), url, None
-            last_err = f"HTTP {r.status_code} from {url.split('/')[2]}"
+            last_err = f"HTTP {r.status_code} from {host}"
         except requests.exceptions.Timeout:
-            last_err = f"Timeout from {url.split('/')[2]}"
+            last_err = f"Timeout from {host}"
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
+            last_err = f"{type(e).__name__} from {host}: {e}"
     return None, None, last_err
 
 
 def parse_overpass(data, polygon):
-    """Parse Overpass JSON → list of building dicts, filtered to polygon."""
+    """Parse Overpass JSON → (buildings list, streets GeoJSON FeatureCollection)."""
     if not data or "elements" not in data:
-        return []
+        return [], {"type": "FeatureCollection", "features": []}
 
-    buildings, seen = [], set()
+    buildings = []
+    seen      = set()
+    streets   = []
 
     for el in data["elements"]:
-        tags = el.get("tags", {})
+        tags  = el.get("tags", {})
         etype = el.get("type")
 
         if etype == "way":
-            center = el.get("center")
-            if not center or "building" not in tags:
+            geom = el.get("geometry", [])
+            if not geom:
                 continue
-            lat, lon = center["lat"], center["lon"]
-            btype = tags.get("building") or "yes"
-        elif etype == "node":
-            if "addr:housenumber" not in tags:
-                continue
+
+            if "highway" in tags:
+                # Walkable street
+                coords = [[n["lon"], n["lat"]] for n in geom]
+                if len(coords) < 2:
+                    continue
+                streets.append({
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": coords},
+                    "properties": {
+                        "highway": tags.get("highway", ""),
+                        "name":    tags.get("name", ""),
+                    },
+                })
+            elif "building" in tags:
+                # Building polygon → use centroid (mean of coordinates)
+                lats = [n["lat"] for n in geom]
+                lons = [n["lon"] for n in geom]
+                lat  = sum(lats) / len(lats)
+                lon  = sum(lons) / len(lons)
+                key  = (round(lat, 5), round(lon, 5))
+                if key in seen or not polygon.contains(Point(lon, lat)):
+                    continue
+                seen.add(key)
+                buildings.append({
+                    "lat":         lat,
+                    "lon":         lon,
+                    "type":        tags.get("building") or "yes",
+                    "housenumber": tags.get("addr:housenumber", ""),
+                    "street":      tags.get("addr:street", ""),
+                    "name":        tags.get("name", ""),
+                })
+
+        elif etype == "node" and "addr:housenumber" in tags:
             lat, lon = el.get("lat"), el.get("lon")
-            btype = "address_node"
-        else:
-            continue
+            if lat is None or lon is None:
+                continue
+            key = (round(lat, 5), round(lon, 5))
+            if key in seen or not polygon.contains(Point(lon, lat)):
+                continue
+            seen.add(key)
+            buildings.append({
+                "lat":         lat,
+                "lon":         lon,
+                "type":        "address_node",
+                "housenumber": tags.get("addr:housenumber", ""),
+                "street":      tags.get("addr:street", ""),
+                "name":        "",
+            })
 
-        if lat is None or lon is None:
-            continue
-
-        key = (round(lat, 5), round(lon, 5))
-        if key in seen or not polygon.contains(Point(lon, lat)):
-            continue
-        seen.add(key)
-
-        buildings.append({
-            "lat":         lat,
-            "lon":         lon,
-            "type":        btype,
-            "housenumber": tags.get("addr:housenumber", ""),
-            "street":      tags.get("addr:street", ""),
-            "name":        tags.get("name", ""),
-        })
-
-    return buildings
-
-
-def set_osmnx_endpoint(url: str):
-    for attr in ("overpass_endpoint", "overpass_url"):
-        if hasattr(ox.settings, attr):
-            setattr(ox.settings, attr, url)
-            return
-
-
-def fetch_street_graph(polygon):
-    """Walkable street graph; tries all mirrors. Returns (graph, err)."""
-    last_err = None
-    for url in OVERPASS_MIRRORS:
-        try:
-            set_osmnx_endpoint(url)
-            G = ox.graph_from_polygon(polygon, network_type="walk")
-            return G, None
-        except Exception as e:
-            last_err = f"{url.split('/')[2]}: {e}"
-    return None, last_err
-
-
-def graph_to_geojson(G):
-    """Single GeoJSON dict → renders 10–100× faster than per-edge PolyLines."""
-    edges_gdf = ox.graph_to_gdfs(G, nodes=False)
-    edges_gdf = edges_gdf[["geometry", "highway"]].copy()
-    edges_gdf["highway"] = edges_gdf["highway"].apply(
-        lambda h: h[0] if isinstance(h, list) else h
-    ).astype(str)
-    return edges_gdf.__geo_interface__
+    streets_fc = {"type": "FeatureCollection", "features": streets}
+    return buildings, streets_fc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CACHED FETCH (1-hour TTL)
+# CACHED FETCH
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
 def fetch_all(polygon_wkt: str):
-    """Fetch buildings + streets. Cached by polygon WKT."""
+    """Fetch buildings + streets in one shot. Cached by polygon WKT."""
     polygon = shapely_wkt.loads(polygon_wkt)
-
     raw, mirror, err = fetch_overpass(polygon)
     if err:
         return {"error": err}
-    buildings = parse_overpass(raw, polygon)
-
-    G, gerr = fetch_street_graph(polygon)
-    edges_geojson = None
-    if G is not None:
-        try:
-            edges_geojson = graph_to_geojson(G)
-        except Exception as e:
-            gerr = f"render: {e}"
-
+    buildings, streets = parse_overpass(raw, polygon)
     return {
-        "buildings":     buildings,
-        "edges_geojson": edges_geojson,
-        "street_error":  gerr,
-        "mirror":        mirror,
+        "buildings":       buildings,
+        "streets_geojson": streets,
+        "mirror":          mirror,
     }
 
 
@@ -280,7 +271,7 @@ st.markdown("""
 st.markdown('<p class="main-title">🗺️ Fundraising Route Planner</p>', unsafe_allow_html=True)
 st.markdown(
     '<p class="sub-title"><span class="phase-badge">Phase 1</span>'
-    '&nbsp; Area selection · House detection · Street network</p>',
+    '&nbsp; Area selection · House detection · Street display</p>',
     unsafe_allow_html=True,
 )
 
@@ -311,8 +302,7 @@ with ctrl_col:
 
     if polygon:
         if area_km2 > MAX_AREA_KM2:
-            st.error(f"Area too large: {area_km2:.2f} km² > {MAX_AREA_KM2} km². "
-                     f"Draw a smaller area.")
+            st.error(f"Area too large: {area_km2:.2f} km² > {MAX_AREA_KM2} km². Draw a smaller area.")
         else:
             st.success(f"Area selected (~{area_km2:.3f} km²)")
     else:
@@ -326,22 +316,16 @@ with ctrl_col:
         disabled=fetch_disabled,
         use_container_width=True,
     ):
-        # Single spinner — no progress bar (which would cause extra reruns)
         with st.spinner("Fetching from OpenStreetMap…"):
             result = fetch_all(polygon.wkt)
 
         if "error" in result:
-            st.error(f"Fetch failed: {result['error']}\n\n"
-                     "Try a smaller area or wait a moment.")
+            st.error(f"Fetch failed: {result['error']}\n\nTry again or use a smaller area.")
         else:
-            st.session_state.buildings      = result["buildings"]
-            st.session_state.edges_geojson  = result["edges_geojson"]
-            st.session_state.selected_types = sorted({b["type"] for b in result["buildings"]})
-            st.session_state.fetch_done     = True
-
-            if result.get("street_error"):
-                st.warning(f"Streets: {result['street_error']}")
-
+            st.session_state.buildings       = result["buildings"]
+            st.session_state.streets_geojson = result["streets_geojson"]
+            st.session_state.selected_types  = sorted({b["type"] for b in result["buildings"]})
+            st.session_state.fetch_done      = True
             mirror = result.get("mirror") or ""
             host   = mirror.split("/")[2] if mirror else "?"
             st.success(f"Found {len(result['buildings'])} buildings · {host}")
@@ -379,9 +363,9 @@ with ctrl_col:
         st.metric("🏠 Visible buildings", len(visible))
         st.metric("📦 Total detected",    len(st.session_state.buildings))
 
-        if st.session_state.edges_geojson:
-            features = st.session_state.edges_geojson.get("features", [])
-            st.metric("🛣️ Street segments", len(features))
+        if st.session_state.streets_geojson:
+            st.metric("🛣️ Street segments",
+                      len(st.session_state.streets_geojson.get("features", [])))
 
     # ── Roadmap ────────────────────────────────────────────────────────────
     st.divider()
@@ -391,7 +375,7 @@ with ctrl_col:
     st.markdown(f"""
 {"✅" if poly else "⏳"} Area selection  
 {"✅" if done else "⏳"} House detection  
-{"✅" if done else "⏳"} Street network  
+{"✅" if done else "⏳"} Street display  
 ⏳ Route planning *(Phase 2)*  
 ⏳ Team splitting *(Phase 3)*  
 ⏳ Parking & transit *(Phase 4)*
@@ -405,8 +389,8 @@ with ctrl_col:
             new_key = st.session_state.map_key + 1
             for k, v in DEFAULTS.items():
                 st.session_state[k] = v
-            st.session_state.map_key           = new_key   # forces full map remount
-            st.session_state.reset_polygon_wkt = old_wkt   # ignore stale drawings
+            st.session_state.map_key           = new_key
+            st.session_state.reset_polygon_wkt = old_wkt
             st.rerun()
 
 
@@ -415,12 +399,32 @@ with ctrl_col:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with map_col:
+
+    # Initial viewport — frame the polygon if one exists, else default to Oslo
+    if st.session_state.polygon:
+        c           = st.session_state.polygon.centroid
+        init_center = [c.y, c.x]
+        # Larger area → smaller zoom
+        a = approximate_area_km2(st.session_state.polygon)
+        if   a > 2.0:    init_zoom = 14
+        elif a > 0.5:    init_zoom = 15
+        elif a > 0.1:    init_zoom = 16
+        else:            init_zoom = 17
+    else:
+        init_center = [59.9139, 10.7522]   # Oslo
+        init_zoom   = 14
+
     m = folium.Map(
-        location=st.session_state.map_center,
-        zoom_start=st.session_state.map_zoom,
+        location=init_center,
+        zoom_start=init_zoom,
         tiles="OpenStreetMap",
-        prefer_canvas=True,        # canvas renderer — much faster for many features
+        prefer_canvas=True,
     )
+
+    # If a polygon exists, ensure it's framed (overrides initial zoom on first render)
+    if st.session_state.polygon:
+        minx, miny, maxx, maxy = st.session_state.polygon.bounds
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     Draw(
         export=False,
@@ -437,24 +441,24 @@ with map_col:
 
     MeasureControl(position="bottomleft", primary_length_unit="meters").add_to(m)
 
-    # Streets in ONE GeoJson layer (huge speedup vs per-edge PolyLine loop)
-    if st.session_state.edges_geojson:
+    # Streets — single GeoJson layer
+    if st.session_state.streets_geojson and st.session_state.streets_geojson.get("features"):
         def style_fn(feature):
             htype = feature["properties"].get("highway", "")
             return {
                 "color":   HIGHWAY_COLORS.get(htype, DEFAULT_HIGHWAY_COLOR),
                 "weight":  2.5,
-                "opacity": 0.8,
+                "opacity": 0.85,
             }
 
         folium.GeoJson(
-            st.session_state.edges_geojson,
+            st.session_state.streets_geojson,
             name="streets",
             style_function=style_fn,
-            tooltip=folium.GeoJsonTooltip(fields=["highway"], aliases=["Type:"]),
+            tooltip=folium.GeoJsonTooltip(fields=["highway", "name"], aliases=["Type:", "Name:"]),
         ).add_to(m)
 
-    # Buildings via FastMarkerCluster (JS-side construction = much faster)
+    # Buildings — clustered, JS-side construction
     if st.session_state.buildings and st.session_state.selected_types:
         visible = [
             [b["lat"], b["lon"]]
@@ -477,7 +481,7 @@ with map_col:
                 options={"maxClusterRadius": 40, "disableClusteringAtZoom": 17},
             ).add_to(m)
 
-    # Legend (only after fetch)
+    # Legend
     if st.session_state.fetch_done:
         m.get_root().html.add_child(folium.Element("""
         <div style="
@@ -497,39 +501,37 @@ with map_col:
         </div>
         """))
 
-    # Render — key change forces full remount, clearing drawn shapes after reset
+    # ─────────────────────────────────────────────────────────────────────
+    # CRITICAL: only return last_active_drawing.
+    # This stops pan/zoom from causing reruns and also stops drawings from
+    # getting interrupted mid-gesture.
+    # ─────────────────────────────────────────────────────────────────────
     map_output = st_folium(
         m,
         key=f"map_{st.session_state.map_key}",
         use_container_width=True,
         height=620,
-        returned_objects=["last_active_drawing", "center", "zoom"],
+        returned_objects=["last_active_drawing"],
     )
 
-    # ── Process map output ─────────────────────────────────────────────────
+    # Process the drawn polygon (if any)
     if map_output:
-        if map_output.get("center"):
-            c = map_output["center"]
-            st.session_state.map_center = [c["lat"], c["lng"]]
-        if map_output.get("zoom"):
-            st.session_state.map_zoom = map_output["zoom"]
-
         drawing = map_output.get("last_active_drawing")
         if drawing:
             try:
                 new_poly = shape(drawing["geometry"])
                 new_wkt  = new_poly.wkt
 
-                # Ignore the SAME drawing we just reset (stale state from old map widget)
+                # Ignore if this matches what we just reset (stale state from old map)
                 if new_wkt == st.session_state.reset_polygon_wkt:
                     pass
                 elif new_poly != st.session_state.polygon:
                     st.session_state.polygon            = new_poly
                     st.session_state.buildings          = []
-                    st.session_state.edges_geojson      = None
+                    st.session_state.streets_geojson    = None
                     st.session_state.fetch_done         = False
                     st.session_state.selected_types     = []
-                    st.session_state.reset_polygon_wkt  = None  # clear once a new shape is drawn
+                    st.session_state.reset_polygon_wkt  = None
                     st.rerun()
             except Exception:
                 pass
