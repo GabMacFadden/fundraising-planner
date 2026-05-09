@@ -3,13 +3,14 @@ Fundraising Route Planner — Phase 2
 Setup wizard → parking / start-point selection → area drawing → optimised routes.
 """
 
+import heapq
 import math
 import random
 import requests
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-from folium.plugins import Draw, MeasureControl
+from folium.plugins import Draw, MeasureControl, Geocoder
 from shapely.geometry import shape, Point, MultiPoint
 from shapely import wkt as shapely_wkt
 
@@ -30,7 +31,7 @@ OVERPASS_MIRRORS = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 USER_AGENT      = "FundraisingRoutePlanner/2.0 (https://streamlit.io)"
-MAX_AREA_KM2    = 4.0
+MAX_AREA_KM2    = 10.0
 REQUEST_TIMEOUT = 60
 WALKABLE_HIGHWAYS = (
     "footway|path|pedestrian|residential|living_street|service|"
@@ -44,20 +45,33 @@ TEAM_COLORS = [
 WALKING_SPEED_KMH = 4.0
 EMPTY_HOUSE_RATE  = 0.35
 EMPTY_DOOR_SEC    = 20
-MAX_END_DIST_M    = 1_000   # 15 min @ 4 km/h ≈ 1 000 m
+MAX_END_DIST_M    = 1_000   # ~15 min @ 4 km/h
+
+HIGHWAY_PRIORITY = {
+    "residential": 10, "living_street": 10, "unclassified": 8,
+    "tertiary": 7,     "tertiary_link": 7,  "footway": 6, "pedestrian": 6,
+    "path": 5,         "service": 4,        "cycleway": 3,
+    "secondary": 3,    "secondary_link": 3, "primary": 2,
+    "primary_link": 2, "steps": 1,
+}
+HOUSE_SNAP_M = 40.0
 
 DEFAULTS = {
-    "stage":               "setup",   # setup | map
-    "center_address":      "",
-    "center_latlng":       None,      # [lat, lon]
+    "stage":               "setup",
+    "center_latlng":       None,
     "transport":           "car",
     "n_people":            2,
     "shift_hours":         4.0,
     "time_per_door":       3.0,
     "same_start":          True,
-    "team_starts":         [],        # [[lat, lon], ...]
-    "selected_parking":    None,      # [lat, lon]
-    "parking_nearby":      [],
+    "team_starts":         [],
+    "selected_parking":    None,
+    "parking_spots":       [],
+    "selected_parking_id": None,
+    "map_mode":            "area",
+    "manual_end":          None,
+    "map_bounds":          None,
+    "street_ways":         [],
     "polygon":             None,
     "buildings":           [],
     "transit_stops":       [],
@@ -66,7 +80,7 @@ DEFAULTS = {
     "routes_done":         False,
     "map_key":             0,
     "reset_polygon_wkt":   None,
-    "last_click_seen":     None,      # dedup map clicks
+    "last_click_seen":     None,
 }
 
 
@@ -115,6 +129,21 @@ def geocode_address(address: str):
     return None
 
 
+def dist_point_to_segment_m(pt, seg_a, seg_b) -> float:
+    """Flat-earth perpendicular distance in metres, clamped to segment."""
+    lat0    = (pt[0] + seg_a[0] + seg_b[0]) / 3.0
+    cos_lat = math.cos(math.radians(lat0))
+    def _m(p):
+        return (p[1] * 111_320 * cos_lat, p[0] * 111_320)
+    px, py = _m(pt); ax, ay = _m(seg_a); bx, by = _m(seg_b)
+    abx, aby = bx - ax, by - ay
+    ab2 = abx * abx + aby * aby
+    if ab2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby) / ab2))
+    return math.hypot(px - ax - t * abx, py - ay - t * aby)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # OVERPASS QUERIES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,7 +156,7 @@ def _post_overpass(query: str):
                               headers=headers, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 return r.json(), None
-        except Exception as ex:
+        except Exception:
             pass
     return None, "All mirrors failed"
 
@@ -161,16 +190,62 @@ out geom tags;
         elif el["type"] == "way" and el.get("geometry"):
             geom = el["geometry"]
             spots.append({
-                "lat": sum(n_["lat"] for n_ in geom) / len(geom),
-                "lon": sum(n_["lon"] for n_ in geom) / len(geom),
+                "lat": sum(nd["lat"] for nd in geom) / len(geom),
+                "lon": sum(nd["lon"] for nd in geom) / len(geom),
                 "name": tags.get("name", "Free parking"),
             })
     return spots
 
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=50)
+def fetch_parking_in_bounds(s: float, w: float, n: float, e: float) -> list:
+    """Parking, schools and kindergartens in the visible map bbox."""
+    query = f"""
+[out:json][timeout:30];
+(
+  node["amenity"="parking"]["access"!="private"]({s},{w},{n},{e});
+  way["amenity"="parking"]["access"!="private"]({s},{w},{n},{e});
+  node["amenity"="kindergarten"]({s},{w},{n},{e});
+  way["amenity"="kindergarten"]({s},{w},{n},{e});
+  node["amenity"="school"]({s},{w},{n},{e});
+  way["amenity"="school"]({s},{w},{n},{e});
+);
+out geom tags;
+""".strip()
+    data, _ = _post_overpass(query)
+    if not data:
+        return []
+    spots = []
+    default_names = {"parking": "Free parking", "kindergarten": "Kindergarten", "school": "School"}
+    for el in data.get("elements", []):
+        tags    = el.get("tags", {})
+        amenity = tags.get("amenity", "")
+        if amenity == "parking" and tags.get("fee", "no").lower() in ("yes", "paid"):
+            continue
+        if el["type"] == "node":
+            lat, lon = el.get("lat"), el.get("lon")
+        elif el["type"] == "way" and el.get("geometry"):
+            geom = el["geometry"]
+            lat = sum(nd["lat"] for nd in geom) / len(geom)
+            lon = sum(nd["lon"] for nd in geom) / len(geom)
+        else:
+            continue
+        if lat is None or lon is None:
+            continue
+        spot_type = amenity if amenity in default_names else "parking"
+        spots.append({
+            "lat":  lat,
+            "lon":  lon,
+            "name": tags.get("name") or default_names[spot_type],
+            "type": spot_type,
+            "id":   f"park_{len(spots)}",
+        })
+    return spots
+
+
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
 def fetch_all(polygon_wkt: str) -> dict:
-    """Buildings + transit stops inside polygon. Cached by WKT."""
+    """Buildings, transit stops and street ways inside polygon."""
     polygon = shapely_wkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = polygon.bounds
     s, w, n, e = miny, minx, maxy, maxx
@@ -184,6 +259,7 @@ def fetch_all(polygon_wkt: str) -> dict:
   node["highway"="bus_stop"]({sp},{wp},{np_},{ep});
   node["railway"~"^(tram_stop|station|halt)$"]({sp},{wp},{np_},{ep});
   node["amenity"="bus_station"]({sp},{wp},{np_},{ep});
+  way["highway"~"^({WALKABLE_HIGHWAYS})$"]({s},{w},{n},{e});
 );
 out geom tags;
 """.strip()
@@ -191,7 +267,7 @@ out geom tags;
     if err or not data:
         return {"error": err or "No data returned"}
 
-    buildings, seen, transit = [], set(), []
+    buildings, seen, transit, street_ways = [], set(), [], []
     for el in data.get("elements", []):
         tags  = el.get("tags", {})
         etype = el.get("type")
@@ -212,6 +288,20 @@ out geom tags;
                 "housenumber": tags.get("addr:housenumber", ""),
                 "street":      tags.get("addr:street", ""),
                 "name":        tags.get("name", ""),
+            })
+
+        elif etype == "way" and "highway" in tags:
+            geom   = el.get("geometry", [])
+            coords = [[nd["lat"], nd["lon"]] for nd in geom]
+            if len(coords) < 2:
+                continue
+            length_m = sum(haversine_m(coords[i - 1], coords[i])
+                           for i in range(1, len(coords)))
+            street_ways.append({
+                "coords":   coords,
+                "highway":  tags.get("highway", "unclassified"),
+                "name":     tags.get("name", ""),
+                "length_m": max(length_m, 1.0),
             })
 
         elif etype == "node":
@@ -239,7 +329,7 @@ out geom tags;
                     "type": stype,
                 })
 
-    return {"buildings": buildings, "transit_stops": transit}
+    return {"buildings": buildings, "transit_stops": transit, "street_ways": street_ways}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -256,8 +346,7 @@ def team_compositions(n: int) -> list:
 
 
 def compute_break_minutes(shift_min: int) -> int:
-    """30 min break for every full 2-hour block."""
-    return (shift_min // 120) * 30
+    return 30
 
 
 def estimate_time(n_houses: int, dist_m: float, time_per_door: float) -> dict:
@@ -326,135 +415,28 @@ def _balance(points: list, clusters: list, max_iter: int = 25) -> list:
     return clusters
 
 
-# ── Nearest-neighbour TSP ─────────────────────────────────────────────────────
-
-def _nn_route(points: list, start=None) -> list:
-    """Returns ordered list of indices."""
-    if not points:
-        return []
-    unvis = list(range(len(points)))
-    first = (min(unvis, key=lambda i: haversine_m(start, points[i]))
-             if start else 0)
-    route = [first]
-    unvis.remove(first)
-    while unvis:
-        last    = route[-1]
-        nearest = min(unvis, key=lambda i: haversine_m(points[last], points[i]))
-        route.append(nearest)
-        unvis.remove(nearest)
-    return route
-
-
-def _nn_route_near_end(points: list, start, target_end) -> list:
-    """NN from start; reverse if that puts the tail closer to target_end."""
-    order = _nn_route(points, start)
-    if haversine_m(points[order[0]], target_end) < haversine_m(points[order[-1]], target_end):
-        return list(reversed(order))
-    return order
-
-
 def _route_dist(wps: list) -> float:
     return sum(haversine_m(wps[i - 1], wps[i]) for i in range(1, len(wps)))
 
 
-# ── Person paths (street-following, anti-backtrack) ───────────────────────────
-
-def _cen(blds: list) -> list:
-    return [
-        sum(b["lat"] for b in blds) / len(blds),
-        sum(b["lon"] for b in blds) / len(blds),
-    ]
-
-
-def _street_path(buildings: list, start=None) -> list:
-    """
-    Group buildings by street name, sort each group along its street axis,
-    then chain groups by nearest-centroid. This makes the person walk each
-    street completely before moving on, minimising double-walking.
-    Dead-end branches are visited as natural detours because their buildings
-    cluster together and are chained back-to-back.
-    """
-    if not buildings:
-        return []
-
-    groups: dict = {}
-    for b in buildings:
-        key = b.get("street", "").strip() or "__nostre__"
-        groups.setdefault(key, []).append(b)
-
-    for key, grp in groups.items():
-        if len(grp) < 2:
-            continue
-        lats = [b["lat"] for b in grp]
-        lons = [b["lon"] for b in grp]
-        if (max(lons) - min(lons)) > (max(lats) - min(lats)):
-            groups[key] = sorted(grp, key=lambda b: b["lon"])
-        else:
-            groups[key] = sorted(grp, key=lambda b: b["lat"])
-
-    glist = list(groups.values())
-
-    # Chain groups: start with the one closest to the given start point
-    first = (min(range(len(glist)), key=lambda i: haversine_m(start, _cen(glist[i])))
-             if start else 0)
-    ordered = [glist.pop(first)]
-    while glist:
-        lc = _cen(ordered[-1])
-        ni = min(range(len(glist)), key=lambda i: haversine_m(lc, _cen(glist[i])))
-        ordered.append(glist.pop(ni))
-
-    return [b for g in ordered for b in g]
-
-
 def _split_left_right(buildings: list):
-    """
-    Split buildings into two halves along the cluster's primary axis.
-    Wider clusters → split N/S; taller → split E/W.
-    """
+    """Split buildings into two halves along the cluster's primary axis."""
     lats = [b["lat"] for b in buildings]
     lons = [b["lon"] for b in buildings]
     clat = sum(lats) / len(lats)
     clon = sum(lons) / len(lons)
-
     if (max(lats) - min(lats)) >= (max(lons) - min(lons)):
         left  = [b for b in buildings if b["lon"] <= clon]
         right = [b for b in buildings if b["lon"] >  clon]
     else:
         left  = [b for b in buildings if b["lat"] <= clat]
         right = [b for b in buildings if b["lat"] >  clat]
-
     if not left or not right:
         half  = len(buildings) // 2
         left  = buildings[:half]
         right = buildings[half:]
-
     return left, right
 
-
-def compute_person_paths(buildings: list, team_size: int, start=None) -> list:
-    """
-    Returns a list of paths (one per person), each path = [[lat, lon], ...].
-
-    1-person team  → single street-following sweep.
-    2-person team  → left/right split; each person sweeps their half.
-    """
-    if not buildings:
-        return []
-
-    if team_size == 1 or len(buildings) < 6:
-        ordered = _street_path(buildings, start)
-        return [[[b["lat"], b["lon"]] for b in ordered]]
-
-    left, right = _split_left_right(buildings)
-    pa = _street_path(left,  start)
-    pb = _street_path(right, start)
-    return [
-        [[b["lat"], b["lon"]] for b in pa],
-        [[b["lat"], b["lon"]] for b in pb],
-    ]
-
-
-# ── Convex-hull contour ───────────────────────────────────────────────────────
 
 def compute_contour(buildings: list):
     """[[lat, lon], ...] convex-hull polygon of the team's buildings."""
@@ -469,11 +451,327 @@ def compute_contour(buildings: list):
     return None
 
 
+# ── Street graph (RPP) ────────────────────────────────────────────────────────
+
+def build_street_graph(street_ways: list) -> dict:
+    """
+    Build undirected adjacency graph from OSM way coordinate arrays.
+    Node ID = (round(lat,5), round(lon,5)).
+    """
+    graph = {}
+    for way in street_ways:
+        coords = way["coords"]
+        for i in range(len(coords) - 1):
+            a, b = coords[i], coords[i + 1]
+            na = (round(a[0], 5), round(a[1], 5))
+            nb = (round(b[0], 5), round(b[1], 5))
+            if na == nb:
+                continue
+            if na not in graph:
+                graph[na] = {"lat": a[0], "lon": a[1], "neighbors": {}}
+            if nb not in graph:
+                graph[nb] = {"lat": b[0], "lon": b[1], "neighbors": {}}
+            dist = haversine_m(a, b)
+            graph[na]["neighbors"][nb] = {"dist_m": dist, "coords": [a, b]}
+            graph[nb]["neighbors"][na] = {"dist_m": dist, "coords": [b, a]}
+    return graph
+
+
+def assign_buildings_to_edges(buildings: list, street_ways: list) -> dict:
+    """
+    Map each building to its nearest street edge.
+    Returns required_edges = {(node_a, node_b): [building, ...]}.
+    Edge key is always (min_id, max_id).
+    """
+    required_edges: dict = {}
+    for bld in buildings:
+        bpt = [bld["lat"], bld["lon"]]
+        best_dist = float("inf")
+        best_edge = None
+        for way in street_ways:
+            coords = way["coords"]
+            clat = sum(c[0] for c in coords) / len(coords)
+            clon = sum(c[1] for c in coords) / len(coords)
+            if haversine_m(bpt, [clat, clon]) > 500:
+                continue
+            for i in range(len(coords) - 1):
+                d = dist_point_to_segment_m(bpt, coords[i], coords[i + 1])
+                if d < best_dist:
+                    best_dist = d
+                    na = (round(coords[i][0], 5),     round(coords[i][1], 5))
+                    nb = (round(coords[i + 1][0], 5), round(coords[i + 1][1], 5))
+                    best_edge = (min(na, nb), max(na, nb))
+        if best_edge is not None:
+            required_edges.setdefault(best_edge, []).append(bld)
+    return required_edges
+
+
+def dijkstra(graph: dict, source) -> tuple:
+    """Standard Dijkstra. Returns (dist, prev) dicts."""
+    dist = {source: 0.0}
+    prev: dict = {}
+    pq = [(0.0, source)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist.get(u, float("inf")):
+            continue
+        for v, edge in graph.get(u, {}).get("neighbors", {}).items():
+            nd = d + edge["dist_m"]
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(pq, (nd, v))
+    return dist, prev
+
+
+def rural_postman_path(graph: dict, required_edges: dict, start_node) -> list:
+    """
+    Rural Postman Problem: find a walk covering all required_edges with
+    minimum repeated traversal. Returns [node_id, ...].
+    """
+    if not required_edges:
+        return [start_node] if start_node in graph else []
+
+    # ── inner helpers ─────────────────────────────────────────────────────────
+
+    def _find_components(req_edges):
+        adj: dict = {}
+        for (a, b) in req_edges:
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+        visited: set = set()
+        components = []
+        for s in adj:
+            if s in visited:
+                continue
+            comp_nodes: set = set()
+            stack = [s]
+            while stack:
+                nd = stack.pop()
+                if nd in visited:
+                    continue
+                visited.add(nd)
+                comp_nodes.add(nd)
+                for nb in adj.get(nd, set()):
+                    if nb not in visited:
+                        stack.append(nb)
+            comp_edges = [e for e in req_edges if e[0] in comp_nodes]
+            components.append(comp_edges)
+        return components
+
+    def _odd_degree_nodes(comp_edges):
+        deg: dict = {}
+        for (a, b) in comp_edges:
+            deg[a] = deg.get(a, 0) + 1
+            deg[b] = deg.get(b, 0) + 1
+        return [nd for nd, d in deg.items() if d % 2 == 1]
+
+    def _reconstruct(prev, src, tgt):
+        path = []
+        nd = tgt
+        while nd != src:
+            path.append(nd)
+            if nd not in prev:
+                return []
+            nd = prev[nd]
+        path.append(src)
+        return list(reversed(path))
+
+    def _greedy_match(odd_nodes, all_d):
+        remaining = list(odd_nodes)
+        pairs = []
+        while len(remaining) >= 2:
+            bd, bi, bj = float("inf"), 0, 1
+            for i in range(len(remaining)):
+                for j in range(i + 1, len(remaining)):
+                    d = all_d.get(remaining[i], {}).get(remaining[j], float("inf"))
+                    if d < bd:
+                        bd, bi, bj = d, i, j
+            pairs.append((remaining[bi], remaining[bj]))
+            remaining.pop(bj)
+            remaining.pop(bi)
+        return pairs
+
+    def _hierholzer(adj_lists):
+        if not adj_lists:
+            return []
+        start = next(iter(adj_lists))
+        adj_copy = {nd: list(nbs) for nd, nbs in adj_lists.items()}
+        stack = [start]
+        circuit = []
+        while stack:
+            v = stack[-1]
+            if adj_copy.get(v):
+                u = adj_copy[v].pop()
+                try:
+                    adj_copy[u].remove(v)
+                except ValueError:
+                    pass
+                stack.append(u)
+            else:
+                circuit.append(stack.pop())
+        return list(reversed(circuit))
+
+    # ── main RPP ──────────────────────────────────────────────────────────────
+
+    components = _find_components(required_edges)
+    component_walks = []
+
+    for comp_edges in components:
+        if not comp_edges:
+            continue
+        comp_adj: dict = {}
+        for (a, b) in comp_edges:
+            comp_adj.setdefault(a, []).append(b)
+            comp_adj.setdefault(b, []).append(a)
+
+        odd = _odd_degree_nodes(comp_edges)
+        if odd:
+            all_dist: dict = {}
+            all_prev: dict = {}
+            for nd in odd:
+                d, p = dijkstra(graph, nd)
+                all_dist[nd] = d
+                all_prev[nd] = p
+            pairs = _greedy_match(odd, all_dist)
+            for (u, v) in pairs:
+                if all_dist.get(u, {}).get(v, float("inf")) == float("inf"):
+                    continue
+                path = _reconstruct(all_prev[u], u, v)
+                for i in range(len(path) - 1):
+                    a, b = path[i], path[i + 1]
+                    comp_adj.setdefault(a, []).append(b)
+                    comp_adj.setdefault(b, []).append(a)
+
+        walk = _hierholzer(comp_adj)
+        if walk:
+            component_walks.append(walk)
+
+    if not component_walks:
+        return []
+
+    if len(component_walks) == 1:
+        final_walk = component_walks[0]
+    else:
+        # Order components by proximity to start_node; connect with Dijkstra
+        if start_node in graph:
+            d0, _ = dijkstra(graph, start_node)
+            order = sorted(range(len(component_walks)),
+                           key=lambda i: d0.get(component_walks[i][0], float("inf")))
+        else:
+            order = list(range(len(component_walks)))
+
+        final_walk: list = []
+        for idx in order:
+            walk = component_walks[idx]
+            if final_walk:
+                src = final_walk[-1]
+                dst = walk[0]
+                d, p = dijkstra(graph, src)
+                connector = _reconstruct(p, src, dst)
+                if len(connector) > 1:
+                    final_walk.extend(connector[1:])
+            final_walk.extend(walk)
+
+    # Rotate to start nearest to start_node
+    if start_node in graph and final_walk:
+        d_s, _ = dijkstra(graph, start_node)
+        best_i = min(range(len(final_walk)),
+                     key=lambda i: d_s.get(final_walk[i], float("inf")))
+        final_walk = final_walk[best_i:] + final_walk[:best_i]
+
+    return final_walk
+
+
+def route_to_coords(node_walk: list, graph: dict) -> list:
+    """Convert a node-ID walk to [[lat,lon],...] using graph edge geometry."""
+    if not node_walk:
+        return []
+    first = graph.get(node_walk[0], {})
+    result = [[first.get("lat", 0), first.get("lon", 0)]]
+    for i in range(1, len(node_walk)):
+        n1, n2 = node_walk[i - 1], node_walk[i]
+        edge = graph.get(n1, {}).get("neighbors", {}).get(n2)
+        if edge and edge.get("coords"):
+            for c in edge["coords"][1:]:
+                result.append([c[0], c[1]])
+        else:
+            n2_nd = graph.get(n2, {})
+            if n2_nd:
+                result.append([n2_nd.get("lat", 0), n2_nd.get("lon", 0)])
+    return result
+
+
+def plan_team_route(buildings: list, street_ways: list, graph: dict,
+                    start_ll) -> dict:
+    """Road-following route for one team via RPP. Returns dict with road_coords."""
+    empty = {
+        "road_coords": [], "left_count": None, "right_count": None,
+        "contour": compute_contour(buildings), "dist_m": 0.0,
+    }
+    if not buildings:
+        return empty
+
+    # Fallback to NN straight-line when no street data
+    if not graph or not street_ways:
+        pts = [[b["lat"], b["lon"]] for b in buildings]
+        if start_ll:
+            unvisited = list(range(len(pts)))
+            cur = start_ll
+            ordered = []
+            while unvisited:
+                j = min(unvisited, key=lambda i: haversine_m(cur, pts[i]))
+                ordered.append(j)
+                cur = pts[j]
+                unvisited.remove(j)
+            road_coords = [pts[i] for i in ordered]
+        else:
+            road_coords = pts
+        dist_m = _route_dist(road_coords) if len(road_coords) >= 2 else 0.0
+        left_count = right_count = None
+        if len(buildings) >= 6:
+            left, right = _split_left_right(buildings)
+            left_count, right_count = len(left), len(right)
+        return {
+            "road_coords": road_coords, "left_count": left_count,
+            "right_count": right_count, "contour": compute_contour(buildings),
+            "dist_m": dist_m,
+        }
+
+    required_edges = assign_buildings_to_edges(buildings, street_ways)
+    if not required_edges:
+        return empty
+
+    if start_ll:
+        start_node = min(graph.keys(),
+                         key=lambda nd: haversine_m(start_ll,
+                                                    [graph[nd]["lat"], graph[nd]["lon"]]))
+    else:
+        start_node = next(iter(required_edges.keys()))[0]
+
+    node_walk   = rural_postman_path(graph, required_edges, start_node)
+    road_coords = route_to_coords(node_walk, graph)
+    dist_m      = (_route_dist(road_coords) if len(road_coords) >= 2 else 0.0)
+
+    left_count = right_count = None
+    if len(buildings) >= 6:
+        left, right = _split_left_right(buildings)
+        left_count, right_count = len(left), len(right)
+
+    return {
+        "road_coords": road_coords,
+        "left_count":  left_count,
+        "right_count": right_count,
+        "contour":     compute_contour(buildings),
+        "dist_m":      dist_m,
+    }
+
+
 # ── Master planner ────────────────────────────────────────────────────────────
 
 def plan_routes(buildings, parking_spot, transit_stops, team_starts,
                 n_people, shift_minutes, time_per_door, transport,
-                coverage=0.90) -> list:
+                street_ways=None, manual_end=None, coverage=0.90) -> list:
 
     if not buildings:
         return []
@@ -490,7 +788,8 @@ def plan_routes(buildings, parking_spot, transit_stops, team_starts,
 
     break_min  = compute_break_minutes(shift_minutes)
     net_min    = shift_minutes - break_min
-    end_target = parking_spot if transport == "car" else None
+
+    graph = build_street_graph(street_ways or [])
 
     result = []
     for ti, (idxs, size) in enumerate(zip(clusters, sizes)):
@@ -500,7 +799,6 @@ def plan_routes(buildings, parking_spot, transit_stops, team_starts,
         c_pts  = [pts[i]       for i in idxs]
         c_blds = [buildings[i] for i in idxs]
 
-        # Resolve start point for this team
         if team_starts:
             if st.session_state.same_start or len(team_starts) == 1:
                 start_ll = team_starts[0]
@@ -513,88 +811,79 @@ def plan_routes(buildings, parking_spot, transit_stops, team_starts,
 
         start_label = ("🅿️ Parking" if transport == "car" else "📍 Start point")
 
-        # Build visit order
-        if end_target:
-            order = _nn_route_near_end(c_pts, start_ll, end_target)
-        else:
-            order = _nn_route(c_pts, start_ll)
+        team_result = plan_team_route(c_blds, street_ways or [], graph, start_ll)
+        road_coords = team_result["road_coords"]
 
-        ordered_pts  = [c_pts[i]  for i in order]
-        ordered_blds = [c_blds[i] for i in order]
-
-        # Determine end
         end_ll, end_label, end_type = _resolve_end(
-            ordered_pts, transit_stops, start_ll, parking_spot, transport
+            c_pts, transit_stops, start_ll, parking_spot, transport,
+            manual_end=manual_end,
         )
 
-        # Distance (start → houses → end)
-        wps = ([start_ll] if start_ll else []) + ordered_pts
-        if end_ll and end_ll != (ordered_pts[-1] if ordered_pts else None):
-            wps.append(end_ll)
-        dist_m = _route_dist(wps)
+        dist_m = team_result["dist_m"] or _route_dist([start_ll] + c_pts)
+        stats  = estimate_time(len(c_blds), dist_m, time_per_door)
+        stats["break_min"]  = break_min
+        stats["net_min"]    = net_min
+        stats["fits_shift"] = stats["total_min"] <= net_min
 
-        stats = estimate_time(len(ordered_pts), dist_m, time_per_door)
-        stats["break_min"]    = break_min
-        stats["net_min"]      = net_min
-        stats["fits_shift"]   = stats["total_min"] <= net_min
+        if c_pts:
+            ref = parking_spot if (transport == "car" and parking_spot) else start_ll
+            if ref:
+                ed = round(haversine_m(c_pts[-1], ref))
+                stats["end_dist_m"] = ed
+                stats["end_ok"]     = ed <= MAX_END_DIST_M
 
-        # End-proximity check
-        if ordered_pts:
-            if transport == "car" and parking_spot:
-                stats["end_dist_m"] = round(haversine_m(ordered_pts[-1], parking_spot))
-                stats["end_ok"]     = stats["end_dist_m"] <= MAX_END_DIST_M
-            else:
-                stats["end_dist_m"] = round(haversine_m(ordered_pts[-1], start_ll))
-                stats["end_ok"]     = stats["end_dist_m"] <= MAX_END_DIST_M
-
-        person_paths = compute_person_paths(ordered_blds, size, start_ll)
-        contour      = compute_contour(c_blds)
+        contour = team_result.get("contour") or compute_contour(c_blds)
 
         result.append({
-            "team_idx":     ti,
-            "size":         size,
-            "color":        TEAM_COLORS[ti % len(TEAM_COLORS)],
-            "houses":       ordered_pts,
-            "house_data":   ordered_blds,
-            "start":        start_ll,
-            "start_label":  start_label,
-            "end":          end_ll,
-            "end_label":    end_label,
-            "end_type":     end_type,
-            "stats":        stats,
-            "person_paths": person_paths,
-            "contour":      contour,
+            "team_idx":    ti,
+            "size":        size,
+            "color":       TEAM_COLORS[ti % len(TEAM_COLORS)],
+            "houses":      c_pts,
+            "house_data":  c_blds,
+            "start":       start_ll,
+            "start_label": start_label,
+            "end":         end_ll,
+            "end_label":   end_label,
+            "end_type":    end_type,
+            "stats":       stats,
+            "road_coords": road_coords,
+            "left_count":  team_result.get("left_count"),
+            "right_count": team_result.get("right_count"),
+            "contour":     contour,
         })
 
     return result
 
 
-def _resolve_end(ordered_pts, transit_stops, start_ll, parking_spot, transport):
+def _resolve_end(ordered_pts, transit_stops, start_ll, parking_spot, transport,
+                 manual_end=None):
     """Pick the best end-point for a team based on transport mode."""
     if not ordered_pts:
         return None, "—", "none"
 
     last = ordered_pts[-1]
 
+    if manual_end is not None:
+        d = haversine_m(last, manual_end) if ordered_pts else 0
+        return manual_end, f"~{round(d)} m to set end point", "manual"
+
     if transport == "car" and parking_spot:
         d = haversine_m(last, parking_spot)
         lbl = (f"~{round(d)} m from parking"
                if d <= MAX_END_DIST_M
-               else f"⚠️ {round(d/1000, 1)} km from parking")
+               else f"⚠️ {round(d / 1000, 1)} km from parking")
         return parking_spot, lbl, "parking"
 
-    # Walk mode: prefer a transit stop within 600 m of the last house
     if transit_stops:
         t = min(transit_stops, key=lambda x: haversine_m(last, [x["lat"], x["lon"]]))
         d = haversine_m(last, [t["lat"], t["lon"]])
         if d < 600:
             return [t["lat"], t["lon"]], t["name"], "transit"
 
-    # Fall back: walk back to start
     d = haversine_m(last, start_ll) if start_ll else 9_999
     lbl = (f"~{round(d)} m back to start"
            if d <= MAX_END_DIST_M
-           else f"⚠️ {round(d/1000,1)} km from start")
+           else f"⚠️ {round(d / 1000, 1)} km from start")
     return start_ll, lbl, "start"
 
 
@@ -644,14 +933,6 @@ if st.session_state.stage == "setup":
     with left:
         with st.form("setup_form"):
 
-            # ── Location ──────────────────────────────────────────────────────
-            st.subheader("📍 Starting location")
-            address = st.text_input(
-                "Address, neighborhood or city",
-                value=st.session_state.center_address,
-                placeholder="e.g. Grünerløkka, Oslo",
-            )
-
             # ── Transport ─────────────────────────────────────────────────────
             st.subheader("🚗 Transport")
             transport = st.radio(
@@ -700,7 +981,7 @@ if st.session_state.stage == "setup":
             shift_min = int(shift_hours * 60)
             brk       = compute_break_minutes(shift_min)
             st.caption(
-                f"→ {brk} min breaks (30 min per 2 h) · "
+                f"→ {brk} min break included · "
                 f"**{shift_min - brk} min active**"
             )
 
@@ -724,59 +1005,44 @@ if st.session_state.stage == "setup":
         st.markdown("#### How it works")
         st.markdown("""
 1. **Fill in the form** on the left and click *Continue*.
-2. The map opens centred on your address.
-   - 🚗 **Car mode** — free parking spots appear on the map; click one to confirm your spot.
-   - 🚶 **Walk mode** — click the map to drop one start-point per team (or one shared point).
+2. The map opens. Use the **search box** (top-left) to navigate to your area.
+   - 🚗 **Car mode** — click **Find parking** to load nearby spots; click one to confirm.
+   - 🚶 **Walk mode** — click **Set start** then drop a marker on the map.
 3. **Draw your work area** with the rectangle or polygon tool.
-4. Click **Fetch & Plan** — the app downloads OSM data and builds optimised routes.
+4. Click **Fetch & Plan** — the app downloads OSM data and builds optimised road-following routes.
 5. Each team gets:
    - a **coloured zone** showing their coverage area
-   - a **main path** through the zone
-   - a **per-person path** (left/right side or solo sweep)
+   - a **road-following path** through the zone
+   - a left/right house count (2-person teams)
    - estimated walk time, talk time and break schedule
 """)
 
     if submitted:
-        if not address.strip():
-            st.error("Please enter an address or area name.")
-            st.stop()
-
-        with st.spinner("Looking up address…"):
-            latlng = geocode_address(address)
-
-        if latlng is None:
-            st.error("Could not find that address. Try adding a city or country.")
-            st.stop()
-
-        parking = []
-        if transport == "car":
-            with st.spinner("Finding free parking nearby…"):
-                parking = fetch_parking_near(latlng[0], latlng[1], 900)
-
-        # Commit to session state and move to map stage
         st.session_state.update(
-            center_address   = address,
-            center_latlng    = latlng,
-            transport        = transport,
-            n_people         = n_people,
-            same_start       = same_start,
-            shift_hours      = shift_hours,
-            time_per_door    = time_per_door,
-            parking_nearby   = parking,
-            team_starts      = [],
-            selected_parking = None,
-            polygon          = None,
-            buildings        = [],
-            transit_stops    = [],
-            fetch_done       = False,
-            routes           = [],
-            routes_done      = False,
-            last_click_seen  = None,
-            stage            = "map",
+            transport           = transport,
+            n_people            = n_people,
+            same_start          = same_start,
+            shift_hours         = shift_hours,
+            time_per_door       = time_per_door,
+            parking_spots       = [],
+            selected_parking_id = None,
+            team_starts         = [],
+            selected_parking    = None,
+            polygon             = None,
+            buildings           = [],
+            transit_stops       = [],
+            fetch_done          = False,
+            routes              = [],
+            routes_done         = False,
+            last_click_seen     = None,
+            map_mode            = "area",
+            manual_end          = None,
+            street_ways         = [],
+            stage               = "map",
         )
         st.rerun()
 
-    st.stop()   # Nothing below renders during setup
+    st.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -800,6 +1066,7 @@ n_t       = num_teams(n_people)
 sizes     = team_compositions(n_people)
 polygon   = st.session_state.polygon
 area_km2  = approximate_area_km2(polygon)
+map_mode  = st.session_state.map_mode
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -810,7 +1077,6 @@ with ctrl_col:
 
     # Session summary + back button
     st.caption(
-        f"📍 {st.session_state.center_address} · "
         f"{'🚗' if transport == 'car' else '🚶'} · "
         f"{n_people} people · {n_t} team{'s' if n_t > 1 else ''} · "
         f"{st.session_state.shift_hours} h"
@@ -826,24 +1092,35 @@ with ctrl_col:
     if transport == "car":
         st.markdown('<p class="step-label">🅿️ Step 1 — Confirm parking</p>',
                     unsafe_allow_html=True)
-        nearby = st.session_state.parking_nearby
 
-        if nearby:
-            st.caption(
-                f"{len(nearby)} free spot(s) found nearby. "
-                "Click a marker **on the map** or pick from the list."
+        bounds_ready = st.session_state.map_bounds is not None
+        if st.button("🅿️ Find parking in visible area",
+                     disabled=not bounds_ready, use_container_width=True):
+            b = st.session_state.map_bounds
+            spots = fetch_parking_in_bounds(
+                b["_southWest"]["lat"], b["_southWest"]["lng"],
+                b["_northEast"]["lat"], b["_northEast"]["lng"],
             )
-            options = {f"{p['name']} ({p['lat']:.4f}, {p['lon']:.4f})": p
-                       for p in nearby}
-            chosen = st.selectbox(
-                "Parking spot", list(options.keys()),
-                index=None, placeholder="Select…", label_visibility="collapsed",
-            )
-            if chosen:
-                p = options[chosen]
-                st.session_state.selected_parking = [p["lat"], p["lon"]]
-        else:
-            st.info("No tagged free parking found. Click on the map to pin your spot.")
+            st.session_state.parking_spots       = spots
+            st.session_state.selected_parking_id = None
+            st.session_state.selected_parking    = None
+            st.rerun()
+
+        if not bounds_ready:
+            st.caption("Pan or zoom the map first to activate the search.")
+
+        for sp in st.session_state.parking_spots:
+            is_sel = (st.session_state.selected_parking_id == sp["id"])
+            icon   = {"parking": "🅿️", "school": "🏫", "kindergarten": "🏡"}[sp["type"]]
+            label  = f"{'✅ ' if is_sel else ''}{icon} {sp['name']}"
+            if st.button(label, key=f"btn_{sp['id']}", use_container_width=True):
+                if is_sel:
+                    st.session_state.selected_parking_id = None
+                    st.session_state.selected_parking    = None
+                else:
+                    st.session_state.selected_parking_id = sp["id"]
+                    st.session_state.selected_parking    = [sp["lat"], sp["lon"]]
+                st.rerun()
 
         if st.session_state.selected_parking:
             p = st.session_state.selected_parking
@@ -852,17 +1129,34 @@ with ctrl_col:
             st.caption("_No parking selected yet._")
 
     else:
-        n_needed = 1 if st.session_state.same_start else n_t
-        n_have   = len(st.session_state.team_starts)
-
         st.markdown('<p class="step-label">📍 Step 1 — Set starting point(s)</p>',
                     unsafe_allow_html=True)
 
+        col_a, col_b = st.columns(2)
+        with col_a:
+            active = (map_mode == "set_start")
+            if st.button("📍 Set start",
+                         type="primary" if active else "secondary",
+                         use_container_width=True):
+                st.session_state.map_mode = "set_start"
+                st.session_state.map_key += 1
+                st.rerun()
+        with col_b:
+            active = (map_mode == "set_end")
+            if st.button("🏁 Set end (opt.)",
+                         type="primary" if active else "secondary",
+                         use_container_width=True):
+                st.session_state.map_mode = "set_end"
+                st.session_state.map_key += 1
+                st.rerun()
+
+        n_needed = 1 if st.session_state.same_start else n_t
+        n_have   = len(st.session_state.team_starts)
         if n_have < n_needed:
             who = ("all teams"
                    if st.session_state.same_start
                    else f"Team {n_have + 1}")
-            st.info(f"👆 Click the map to place the start point for **{who}**.")
+            st.info(f"Drop a start marker for **{who}**.")
         else:
             st.success(
                 f"✅ {'Starting point' if n_needed == 1 else f'{n_have} starting points'} set."
@@ -875,6 +1169,13 @@ with ctrl_col:
         for i, s in enumerate(st.session_state.team_starts):
             lbl = "All teams" if st.session_state.same_start else f"Team {i + 1}"
             st.caption(f"📍 {lbl}: {s[0]:.4f}, {s[1]:.4f}")
+
+        if st.session_state.manual_end:
+            e = st.session_state.manual_end
+            st.caption(f"🏁 End: {e[0]:.4f}, {e[1]:.4f}")
+            if st.button("✕ Clear end point", use_container_width=True):
+                st.session_state.manual_end = None
+                st.rerun()
 
     st.divider()
 
@@ -901,8 +1202,8 @@ with ctrl_col:
         transport == "car"
         or len(st.session_state.team_starts) >= (1 if st.session_state.same_start else n_t)
     )
-    area_ok   = polygon is not None and area_km2 <= MAX_AREA_KM2
-    can_go    = starts_ok and area_ok
+    area_ok = polygon is not None and area_km2 <= MAX_AREA_KM2
+    can_go  = starts_ok and area_ok
 
     if not starts_ok:
         st.caption("Set your starting point(s) first (Step 1).")
@@ -920,12 +1221,12 @@ with ctrl_col:
         else:
             st.session_state.buildings     = result["buildings"]
             st.session_state.transit_stops = result.get("transit_stops", [])
+            st.session_state.street_ways   = result.get("street_ways", [])
             st.session_state.fetch_done    = True
 
             if not result["buildings"]:
                 st.warning("No buildings found. Try a larger area.")
             else:
-                # Build the per-team starts list
                 if transport == "car":
                     effective_starts = (
                         [st.session_state.selected_parking] * n_t
@@ -949,6 +1250,8 @@ with ctrl_col:
                         shift_minutes  = int(st.session_state.shift_hours * 60),
                         time_per_door  = st.session_state.time_per_door,
                         transport      = transport,
+                        street_ways    = result.get("street_ways", []),
+                        manual_end     = st.session_state.get("manual_end"),
                         coverage       = 0.90,
                     )
 
@@ -974,17 +1277,17 @@ with ctrl_col:
             over  = (f" (+{s['total_min'] - s['net_min']} min)"
                      if not s["fits_shift"] else "")
 
-            end_d     = s.get("end_dist_m", "?")
-            end_ok    = s.get("end_ok", True)
-            end_icon  = "✅" if end_ok else "⚠️"
-            end_note  = (
+            end_d    = s.get("end_dist_m", "?")
+            end_ok   = s.get("end_ok", True)
+            end_icon = "✅" if end_ok else "⚠️"
+            end_note = (
                 f"<br>🅿️ End: {end_d} m to parking {end_icon}"
                 if transport == "car"
                 else f"<br>🏁 End: {end_d} m from start {end_icon}"
             )
 
-            n_paths = len(r.get("person_paths", []))
-            sub = (f"<br>↳ {n_paths} person-paths" if n_paths > 1 else "")
+            lr = (f"<br>↳ L: {r['left_count']} · R: {r['right_count']} houses (opposite sides)"
+                  if r.get("left_count") is not None else "")
 
             st.markdown(
                 f"""<div class="team-card" style="border-color:{color}">
@@ -992,7 +1295,7 @@ with ctrl_col:
                 ({r['size']}p)<br>
                 🏠 {len(r['houses'])} houses &nbsp;·&nbsp; 🚶 {s['distance_m']} m<br>
                 ⏱️ {s['walk_min']} + {s['talk_min']} = <b>{s['total_min']} min</b>
-                {fits}{over}{end_note}{sub}
+                {fits}{over}{end_note}{lr}
                 </div>""",
                 unsafe_allow_html=True,
             )
@@ -1011,14 +1314,19 @@ with ctrl_col:
         if st.button("🔄 Reset area & routes", use_container_width=True):
             old_wkt = polygon.wkt if polygon else None
             st.session_state.update(
-                polygon          = None,
-                buildings        = [],
-                transit_stops    = [],
-                fetch_done       = False,
-                routes           = [],
-                routes_done      = False,
-                map_key          = st.session_state.map_key + 1,
-                reset_polygon_wkt = old_wkt,
+                polygon             = None,
+                buildings           = [],
+                transit_stops       = [],
+                fetch_done          = False,
+                routes              = [],
+                routes_done         = False,
+                map_key             = st.session_state.map_key + 1,
+                reset_polygon_wkt   = old_wkt,
+                street_ways         = [],
+                map_mode            = "area",
+                manual_end          = None,
+                parking_spots       = [],
+                selected_parking_id = None,
             )
             st.rerun()
 
@@ -1047,34 +1355,55 @@ with map_col:
         minx, miny, maxx, maxy = polygon.bounds
         m.fit_bounds([[miny, minx], [maxy, maxx]])
 
-    Draw(
-        export=False,
-        draw_options={
-            "polyline": False, "polygon": True,
-            "circle": False, "marker": False,
-            "circlemarker": False, "rectangle": True,
-        },
-        edit_options={"edit": False, "remove": True},
-    ).add_to(m)
+    # Draw plugin — mode-dependent options
+    if map_mode in ("set_start", "set_end"):
+        draw_opts = {
+            "polygon": False, "rectangle": False, "marker": True,
+            "polyline": False, "circle": False, "circlemarker": False,
+        }
+    else:
+        draw_opts = {
+            "polygon": True, "rectangle": True, "marker": False,
+            "polyline": False, "circle": False, "circlemarker": False,
+        }
+    Draw(export=False, draw_options=draw_opts,
+         edit_options={"edit": False, "remove": True}).add_to(m)
+
     MeasureControl(position="bottomleft", primary_length_unit="meters").add_to(m)
+    Geocoder(position="topleft", collapsed=False, add_marker=True).add_to(m)
+
+    # Instruction overlay when placing a marker
+    if map_mode in ("set_start", "set_end"):
+        msg = ("📍 Drop a marker for the <b>start point</b>"
+               if map_mode == "set_start"
+               else "🏁 Drop a marker for the <b>end point</b>")
+        m.get_root().html.add_child(folium.Element(f"""
+        <div style="position:fixed;top:80px;left:50%;transform:translateX(-50%);
+            z-index:9999;background:rgba(41,128,185,.93);color:#fff;
+            padding:8px 18px;border-radius:20px;font-size:13px;font-weight:600;
+            font-family:Arial,sans-serif;pointer-events:none;">
+          {msg}
+        </div>"""))
 
     # ── Pre-route: parking / start markers ────────────────────────────────────
 
     if not st.session_state.routes_done:
         if transport == "car":
-            sel = st.session_state.selected_parking
-            for p in st.session_state.parking_nearby:
-                is_sel = (sel and abs(sel[0] - p["lat"]) < 0.0002
-                          and abs(sel[1] - p["lon"]) < 0.0002)
+            icon_map = {"parking": "car", "school": "graduation-cap",
+                        "kindergarten": "child"}
+            for sp in st.session_state.parking_spots:
+                is_sel = (st.session_state.selected_parking_id == sp["id"])
                 folium.Marker(
-                    location=[p["lat"], p["lon"]],
-                    tooltip=f"🅿️ {p['name']} — click to select",
+                    location=[sp["lat"], sp["lon"]],
+                    tooltip=sp["id"],
                     icon=folium.Icon(
                         color="green" if is_sel else "gray",
-                        icon="car", prefix="fa",
+                        icon=icon_map.get(sp["type"], "car"), prefix="fa",
                     ),
                 ).add_to(m)
-            if sel:
+            # Show custom pin if selected but not from the list
+            sel = st.session_state.selected_parking
+            if sel and not st.session_state.parking_spots:
                 folium.Marker(
                     location=sel,
                     tooltip="🅿️ Your parking spot",
@@ -1089,16 +1418,20 @@ with map_col:
                     tooltip=f"📍 {lbl} start",
                     icon=folium.Icon(color="blue", icon="play", prefix="fa"),
                 ).add_to(m)
+            if st.session_state.manual_end:
+                folium.Marker(
+                    location=st.session_state.manual_end,
+                    tooltip="🏁 End point",
+                    icon=folium.Icon(color="orange", icon="flag", prefix="fa"),
+                ).add_to(m)
 
-    # ── Route layers (shown instead of raw markers once routes exist) ─────────
+    # ── Route layers ──────────────────────────────────────────────────────────
 
     if st.session_state.routes_done and st.session_state.routes:
         for r in st.session_state.routes:
             color     = r["color"]
-            light     = lighten(color, 0.5)
             team_name = f"Team {r['team_idx'] + 1}"
 
-            # Filled team-zone contour
             if r.get("contour"):
                 folium.Polygon(
                     locations=r["contour"],
@@ -1107,23 +1440,14 @@ with map_col:
                     tooltip=f"{team_name} coverage zone",
                 ).add_to(m)
 
-            # Person paths
-            person_paths = r.get("person_paths", [])
-            path_colors  = [color, light]
-            for pi, path in enumerate(person_paths):
-                if len(path) < 2:
-                    continue
-                pc  = path_colors[pi % len(path_colors)]
-                tip = (f"{team_name} – Person {pi + 1}"
-                       if len(person_paths) > 1 else team_name)
+            road_coords = r.get("road_coords", [])
+            if len(road_coords) >= 2:
                 folium.PolyLine(
-                    locations=path,
-                    color=pc, weight=3.5 if pi == 0 else 2.5,
-                    opacity=0.9 if pi == 0 else 0.65,
-                    tooltip=tip,
+                    locations=road_coords,
+                    color=color, weight=3.5, opacity=0.85,
+                    tooltip=f"{team_name} — {len(r['houses'])} houses",
                 ).add_to(m)
 
-            # Start marker
             if r["start"]:
                 folium.Marker(
                     location=r["start"],
@@ -1135,7 +1459,6 @@ with map_col:
                     ),
                 ).add_to(m)
 
-            # End marker (only if distinct from start)
             end = r.get("end")
             if end and end != r["start"]:
                 e_type = r.get("end_type", "start")
@@ -1184,14 +1507,67 @@ with map_col:
         key=f"map_{st.session_state.map_key}",
         use_container_width=True,
         height=640,
-        returned_objects=["last_active_drawing", "last_clicked"],
+        returned_objects=[
+            "last_active_drawing", "last_clicked",
+            "last_geocoder_result", "last_object_clicked_tooltip", "bounds",
+        ],
     )
 
-    # ── Process drawing ────────────────────────────────────────────────────────
+    # ── Process map output ─────────────────────────────────────────────────────
 
     if map_out:
-        drawing = map_out.get("last_active_drawing")
-        if drawing:
+
+        # Store bounds (needed for parking button)
+        if map_out.get("bounds"):
+            st.session_state.map_bounds = map_out["bounds"]
+
+        # Geocoder result → re-centre map
+        geo = map_out.get("last_geocoder_result")
+        if geo:
+            try:
+                c   = geo.get("center") or geo
+                lat = float(c.get("lat") or c.get("y"))
+                lon = float(c.get("lng") or c.get("x"))
+                st.session_state.center_latlng = [lat, lon]
+                st.session_state.map_key += 1
+                st.rerun()
+            except Exception:
+                pass
+
+        # Parking marker click via tooltip
+        tooltip_clicked = map_out.get("last_object_clicked_tooltip")
+        if (tooltip_clicked and str(tooltip_clicked).startswith("park_")
+                and not st.session_state.routes_done):
+            spot_id = str(tooltip_clicked)
+            if st.session_state.selected_parking_id == spot_id:
+                st.session_state.selected_parking_id = None
+                st.session_state.selected_parking    = None
+            else:
+                match = next((sp for sp in st.session_state.parking_spots
+                              if sp["id"] == spot_id), None)
+                if match:
+                    st.session_state.selected_parking_id = spot_id
+                    st.session_state.selected_parking    = [match["lat"], match["lon"]]
+            st.rerun()
+
+        # Drawing: Point (start/end placement) or Polygon (area)
+        drawing   = map_out.get("last_active_drawing")
+        geom_type = drawing.get("geometry", {}).get("type", "") if drawing else ""
+
+        if geom_type == "Point" and map_mode in ("set_start", "set_end"):
+            coords = drawing["geometry"]["coordinates"]  # [lon, lat]
+            ll = [coords[1], coords[0]]
+            if map_mode == "set_start":
+                n_needed = 1 if st.session_state.same_start else n_t
+                if len(st.session_state.team_starts) < n_needed:
+                    st.session_state.team_starts = st.session_state.team_starts + [ll]
+            else:
+                st.session_state.manual_end = ll
+            st.session_state.map_mode = "area"
+            st.session_state.map_key += 1
+            st.rerun()
+
+        elif geom_type in ("Polygon", "MultiPolygon"):
             try:
                 new_poly = shape(drawing["geometry"])
                 new_wkt  = new_poly.wkt
@@ -1207,32 +1583,3 @@ with map_col:
                     st.rerun()
             except Exception:
                 pass
-
-        # ── Process map click ──────────────────────────────────────────────────
-
-        clicked = map_out.get("last_clicked")
-        if clicked and not st.session_state.routes_done:
-            click_key = (round(clicked["lat"], 5), round(clicked["lng"], 5))
-
-            if click_key != st.session_state.last_click_seen:
-                st.session_state.last_click_seen = click_key
-                click_ll = [clicked["lat"], clicked["lng"]]
-
-                if transport == "car":
-                    # Snap to the nearest parking marker within 120 m, else custom pin
-                    nearby = st.session_state.parking_nearby
-                    if nearby:
-                        best  = min(nearby, key=lambda p: haversine_m(click_ll, [p["lat"], p["lon"]]))
-                        dist  = haversine_m(click_ll, [best["lat"], best["lon"]])
-                        st.session_state.selected_parking = (
-                            [best["lat"], best["lon"]] if dist < 120 else click_ll
-                        )
-                    else:
-                        st.session_state.selected_parking = click_ll
-                    st.rerun()
-
-                else:
-                    n_needed = 1 if st.session_state.same_start else n_t
-                    if len(st.session_state.team_starts) < n_needed:
-                        st.session_state.team_starts = st.session_state.team_starts + [click_ll]
-                        st.rerun()
