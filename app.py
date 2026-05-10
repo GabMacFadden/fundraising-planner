@@ -94,9 +94,10 @@ DEFAULTS = {
     "reset_polygon_wkt":     None,
     "last_click_seen":       None,
     "isolation_threshold_m": 0,
-    "route_detail":          "full",
+    "route_detail":          "most",
     "show_legend":           True,
     "show_parking_markers":  False,
+    "drop_excess":           True,
 }
 
 
@@ -213,6 +214,38 @@ def _douglas_peucker(coords: list, epsilon_m: float) -> list:
             + _douglas_peucker(coords[max_i:], epsilon_m)
         )
     return [coords[0], coords[-1]]
+
+
+DETAIL_PRIORITY_THRESHOLDS = {"all": 99, "most": 8, "major": 3}
+
+
+def _filter_segments_by_priority(segments: list, threshold: int) -> list:
+    if threshold >= 99:
+        return [list(seg["coords"]) for seg in segments if seg.get("coords")]
+    polylines = []
+    cur = []
+    for seg in segments:
+        coords = seg.get("coords") or []
+        if len(coords) < 2:
+            continue
+        hw   = seg.get("highway", "unclassified")
+        pri  = HIGHWAY_PRIORITY.get(hw, 99)
+        keep = (hw != "connector") and (pri <= threshold)
+        if keep:
+            if not cur:
+                cur = list(coords)
+            elif cur[-1] == coords[0]:
+                cur.extend(coords[1:])
+            else:
+                polylines.append(cur)
+                cur = list(coords)
+        else:
+            if cur:
+                polylines.append(cur)
+                cur = []
+    if cur:
+        polylines.append(cur)
+    return polylines
 
 
 def _filter_isolated(buildings: list, threshold_m: float) -> list:
@@ -445,6 +478,79 @@ def estimate_time(n_houses: int, dist_m: float, time_per_door: float) -> dict:
     }
 
 
+def _project_buildings_on_route(buildings: list, road_coords: list) -> list:
+    if not buildings:
+        return []
+    if not road_coords or len(road_coords) < 2:
+        if road_coords:
+            ref = road_coords[0]
+        elif buildings:
+            ref = [buildings[0]["lat"], buildings[0]["lon"]]
+        else:
+            return [0.0] * len(buildings)
+        return [haversine_m(ref, [b["lat"], b["lon"]]) for b in buildings]
+
+    cum = [0.0]
+    for i in range(1, len(road_coords)):
+        cum.append(cum[-1] + haversine_m(road_coords[i - 1], road_coords[i]))
+
+    positions = []
+    for b in buildings:
+        bp = [b["lat"], b["lon"]]
+        best_d, best_pos = float("inf"), 0.0
+        for i in range(1, len(road_coords)):
+            a, c = road_coords[i - 1], road_coords[i]
+            d = dist_point_to_segment_m(bp, a, c)
+            if d < best_d:
+                best_d = d
+                seg_len = haversine_m(a, c)
+                if seg_len < 1e-6:
+                    best_pos = cum[i - 1]
+                else:
+                    lat0    = (bp[0] + a[0] + c[0]) / 3.0
+                    cos_lat = math.cos(math.radians(lat0))
+                    ax, ay = a[1] * 111_320 * cos_lat, a[0] * 111_320
+                    cx, cy = c[1] * 111_320 * cos_lat, c[0] * 111_320
+                    px, py = bp[1] * 111_320 * cos_lat, bp[0] * 111_320
+                    abx, aby = cx - ax, cy - ay
+                    ab2 = abx * abx + aby * aby
+                    t = 0.0 if ab2 < 1e-9 else max(
+                        0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby) / ab2))
+                    best_pos = cum[i - 1] + t * seg_len
+        positions.append(best_pos)
+    return positions
+
+
+def _trim_to_shift(c_blds: list, street_ways: list, graph: dict, start_ll,
+                   time_per_door: float, net_min: float,
+                   max_iters: int = 8) -> tuple:
+    blds        = list(c_blds)
+    dropped     = 0
+    team_result = plan_team_route(blds, street_ways, graph, start_ll)
+    dist_m      = team_result["dist_m"] or 0.0
+    stats       = estimate_time(len(blds), dist_m, time_per_door)
+
+    for _ in range(max_iters):
+        if stats["total_min"] <= net_min or len(blds) <= 1:
+            break
+        excess_min = stats["total_min"] - net_min
+        per_house  = stats["total_min"] / max(1, len(blds))
+        n_drop     = max(1, math.ceil(excess_min / max(per_house, 0.1)))
+        n_drop     = min(n_drop, len(blds) - 1)
+
+        positions = _project_buildings_on_route(blds, team_result["road_coords"])
+        order     = sorted(range(len(blds)), key=lambda i: positions[i], reverse=True)
+        drop_idx  = set(order[:n_drop])
+        blds      = [b for i, b in enumerate(blds) if i not in drop_idx]
+        dropped  += n_drop
+
+        team_result = plan_team_route(blds, street_ways, graph, start_ll)
+        dist_m      = team_result["dist_m"] or 0.0
+        stats       = estimate_time(len(blds), dist_m, time_per_door)
+
+    return blds, team_result, stats, dropped
+
+
 # ── Clustering ────────────────────────────────────────────────────────────────
 
 def _kmeans(points: list, k: int, seed: int = 42, max_iter: int = 40) -> list:
@@ -536,6 +642,7 @@ def build_street_graph(street_ways: list) -> dict:
     graph = {}
     for way in street_ways:
         coords = way["coords"]
+        hw     = way.get("highway", "unclassified")
         for i in range(len(coords) - 1):
             a, b = coords[i], coords[i + 1]
             na = (round(a[0], 5), round(a[1], 5))
@@ -547,8 +654,8 @@ def build_street_graph(street_ways: list) -> dict:
             if nb not in graph:
                 graph[nb] = {"lat": b[0], "lon": b[1], "neighbors": {}}
             dist = haversine_m(a, b)
-            graph[na]["neighbors"][nb] = {"dist_m": dist, "coords": [a, b]}
-            graph[nb]["neighbors"][na] = {"dist_m": dist, "coords": [b, a]}
+            graph[na]["neighbors"][nb] = {"dist_m": dist, "coords": [a, b], "highway": hw}
+            graph[nb]["neighbors"][na] = {"dist_m": dist, "coords": [b, a], "highway": hw}
     return graph
 
 
@@ -760,11 +867,42 @@ def route_to_coords(node_walk: list, graph: dict) -> list:
     return result
 
 
+def route_to_coords_and_segments(node_walk: list, graph: dict) -> tuple:
+    if not node_walk:
+        return [], []
+    first = graph.get(node_walk[0], {})
+    flat  = [[first.get("lat", 0), first.get("lon", 0)]]
+    segments = []
+    for i in range(1, len(node_walk)):
+        n1, n2 = node_walk[i - 1], node_walk[i]
+        edge   = graph.get(n1, {}).get("neighbors", {}).get(n2)
+        if edge and edge.get("coords"):
+            seg_coords = [[c[0], c[1]] for c in edge["coords"]]
+            for c in seg_coords[1:]:
+                flat.append([c[0], c[1]])
+            segments.append({
+                "coords":  seg_coords,
+                "highway": edge.get("highway", "unclassified"),
+            })
+        else:
+            n2_nd = graph.get(n2, {})
+            if n2_nd:
+                end_pt = [n2_nd.get("lat", 0), n2_nd.get("lon", 0)]
+                start_pt = list(flat[-1])
+                flat.append(end_pt)
+                segments.append({
+                    "coords":  [start_pt, end_pt],
+                    "highway": "connector",
+                })
+    return flat, segments
+
+
 def plan_team_route(buildings: list, street_ways: list, graph: dict,
                     start_ll) -> dict:
     empty = {
-        "road_coords": [], "left_count": None, "right_count": None,
-        "contour": compute_contour(buildings), "dist_m": 0.0,
+        "road_coords": [], "road_segments": [], "left_count": None,
+        "right_count": None, "contour": compute_contour(buildings),
+        "dist_m": 0.0,
     }
     if not buildings:
         return empty
@@ -788,10 +926,14 @@ def plan_team_route(buildings: list, street_ways: list, graph: dict,
         if len(buildings) >= 6:
             left, right = _split_left_right(buildings)
             left_count, right_count = len(left), len(right)
+        road_segments = (
+            [{"coords": road_coords, "highway": "unclassified"}]
+            if len(road_coords) >= 2 else []
+        )
         return {
-            "road_coords": road_coords, "left_count": left_count,
-            "right_count": right_count, "contour": compute_contour(buildings),
-            "dist_m": dist_m,
+            "road_coords": road_coords, "road_segments": road_segments,
+            "left_count": left_count, "right_count": right_count,
+            "contour": compute_contour(buildings), "dist_m": dist_m,
         }
 
     required_edges = assign_buildings_to_edges(buildings, street_ways)
@@ -805,9 +947,9 @@ def plan_team_route(buildings: list, street_ways: list, graph: dict,
     else:
         start_node = next(iter(required_edges.keys()))[0]
 
-    node_walk   = rural_postman_path(graph, required_edges, start_node)
-    road_coords = route_to_coords(node_walk, graph)
-    dist_m      = (_route_dist(road_coords) if len(road_coords) >= 2 else 0.0)
+    node_walk = rural_postman_path(graph, required_edges, start_node)
+    road_coords, road_segments = route_to_coords_and_segments(node_walk, graph)
+    dist_m    = (_route_dist(road_coords) if len(road_coords) >= 2 else 0.0)
 
     left_count = right_count = None
     if len(buildings) >= 6:
@@ -815,11 +957,12 @@ def plan_team_route(buildings: list, street_ways: list, graph: dict,
         left_count, right_count = len(left), len(right)
 
     return {
-        "road_coords": road_coords,
-        "left_count":  left_count,
-        "right_count": right_count,
-        "contour":     compute_contour(buildings),
-        "dist_m":      dist_m,
+        "road_coords":   road_coords,
+        "road_segments": road_segments,
+        "left_count":    left_count,
+        "right_count":   right_count,
+        "contour":       compute_contour(buildings),
+        "dist_m":        dist_m,
     }
 
 
@@ -828,7 +971,7 @@ def plan_team_route(buildings: list, street_ways: list, graph: dict,
 def plan_routes(buildings, car_parkings, transit_stops, team_starts,
                 n_people, shift_minutes, time_per_door, transport,
                 street_ways=None, manual_end=None, n_cars=1, coverage=0.90,
-                isolation_threshold_m=0) -> list:
+                isolation_threshold_m=0, drop_excess=False) -> list:
 
     if not buildings:
         return []
@@ -905,6 +1048,19 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
             start_label = ("🅿️ Parking" if transport == "car" else "📍 Start point")
 
             team_result = plan_team_route(c_blds, street_ways or [], graph, start_ll)
+
+            dist_m  = team_result["dist_m"] or _route_dist([start_ll] + c_pts)
+            stats   = estimate_time(len(c_blds), dist_m, time_per_door)
+            dropped = 0
+
+            if drop_excess and stats["total_min"] > net_min and len(c_blds) > 1:
+                c_blds, team_result, stats, dropped = _trim_to_shift(
+                    c_blds, street_ways or [], graph, start_ll,
+                    time_per_door, net_min,
+                )
+                c_pts  = [[b["lat"], b["lon"]] for b in c_blds]
+                dist_m = team_result["dist_m"] or _route_dist([start_ll] + c_pts)
+
             road_coords = team_result["road_coords"]
 
             end_ll, end_label, end_type = _resolve_end(
@@ -912,8 +1068,6 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
                 manual_end=manual_end,
             )
 
-            dist_m = team_result["dist_m"] or _route_dist([start_ll] + c_pts)
-            stats  = estimate_time(len(c_blds), dist_m, time_per_door)
             stats["break_min"]  = break_min
             stats["net_min"]    = net_min
             stats["fits_shift"] = stats["total_min"] <= net_min
@@ -941,9 +1095,11 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
                 "end_type":    end_type,
                 "stats":       stats,
                 "road_coords": road_coords,
+                "road_segments": team_result.get("road_segments", []),
                 "left_count":  team_result.get("left_count"),
                 "right_count": team_result.get("right_count"),
                 "contour":     contour,
+                "dropped":     dropped,
             })
             global_ti += 1
 
@@ -1115,6 +1271,16 @@ if st.session_state.stage == "setup":
                         "neighbour will be skipped."
                     )
 
+                drop_excess = st.checkbox(
+                    "Drop houses that won't fit in shift",
+                    value=st.session_state.get("drop_excess", True),
+                    help=(
+                        "When a team's planned route exceeds the active shift "
+                        "time, drop the houses farthest along the route until "
+                        "it fits."
+                    ),
+                )
+
             submitted = st.form_submit_button(
                 "Continue to map →", type="primary", use_container_width=True
             )
@@ -1157,6 +1323,7 @@ if st.session_state.stage == "setup":
             shift_hours            = shift_hours,
             time_per_door          = time_per_door,
             isolation_threshold_m  = isolation_threshold_m,
+            drop_excess            = drop_excess,
             car_parkings           = [],
             car_park_ids           = [],
             selecting_car          = 0,
@@ -1175,7 +1342,7 @@ if st.session_state.stage == "setup":
             map_mode               = "area",
             manual_end             = None,
             street_ways            = [],
-            route_detail           = "full",
+            route_detail           = "most",
             show_legend            = True,
             stage                  = "map",
         )
@@ -1294,7 +1461,7 @@ with ctrl_col:
                 if st.session_state.selecting_car == ci and st.session_state.parking_spots:
                     n_spots = len(st.session_state.parking_spots)
 
-                    col_info, col_tog = st.columns([2, 1])
+                    col_info, col_tog, col_done = st.columns([2, 1, 1])
                     with col_info:
                         st.caption(f"{n_spots} spot{'s' if n_spots != 1 else ''} found")
                     with col_tog:
@@ -1306,6 +1473,17 @@ with ctrl_col:
                             help="Show or hide parking markers on the map (to avoid accidental clicks while drawing)",
                         ):
                             st.session_state.show_parking_markers = not show_m
+                            st.session_state.map_key += 1
+                            st.rerun()
+                    with col_done:
+                        if st.button(
+                            "✓ Done",
+                            key=f"done_pk_{ci}",
+                            use_container_width=True,
+                            help="Hide the parking list and markers (your selection is kept)",
+                        ):
+                            st.session_state.parking_spots        = []
+                            st.session_state.show_parking_markers = False
                             st.session_state.map_key += 1
                             st.rerun()
 
@@ -1473,6 +1651,7 @@ with ctrl_col:
                         n_cars                 = n_cars,
                         coverage               = 0.90,
                         isolation_threshold_m  = st.session_state.isolation_threshold_m,
+                        drop_excess            = st.session_state.get("drop_excess", True),
                     )
 
                 st.session_state.routes      = routes
@@ -1516,13 +1695,19 @@ with ctrl_col:
             lr = (f"<br>↳ L: {r['left_count']} · R: {r['right_count']} houses (opposite sides)"
                   if r.get("left_count") is not None else "")
 
+            dropped = r.get("dropped", 0)
+            drop_note = (
+                f'<br><span style="color:#888">↳ {dropped} house(s) dropped to fit shift</span>'
+                if dropped else ""
+            )
+
             st.markdown(
                 f"""<div class="team-card" style="border-color:{color}">
                 <b style="color:{color}">Team {r['team_idx'] + 1}</b>
                 ({r['size']}p)<br>
                 🏠 {len(r['houses'])} houses &nbsp;·&nbsp; 🚶 {s['distance_m']} m<br>
                 ⏱️ {s['walk_min']} + {s['talk_min']} = <b>{s['total_min']} min</b>
-                {fits}{over}{end_note}{lr}
+                {fits}{over}{end_note}{lr}{drop_note}
                 </div>""",
                 unsafe_allow_html=True,
             )
@@ -1546,9 +1731,17 @@ with ctrl_col:
         st.divider()
         st.caption("Display options")
 
-        _detail_labels = {"full": "Full roads", "medium": "Simplified", "simple": "Waypoints only"}
+        _detail_labels = {
+            "full":   "Full roads",
+            "most":   "Most roads",
+            "major":  "Major roads only",
+            "medium": "Simplified",
+            "simple": "Waypoints only",
+        }
         _detail_opts   = list(_detail_labels.keys())
-        current_detail = st.session_state.get("route_detail", "full")
+        current_detail = st.session_state.get("route_detail", "most")
+        if current_detail not in _detail_opts:
+            current_detail = "most"
         new_detail = st.radio(
             "Route detail",
             options=_detail_opts,
@@ -1714,20 +1907,30 @@ with map_col:
                     tooltip=f"{team_name} coverage zone",
                 ).add_to(m)
 
-            road_coords = r.get("road_coords", [])
+            road_coords   = r.get("road_coords", [])
+            road_segments = r.get("road_segments", [])
+
             if detail == "medium" and len(road_coords) > 2:
-                road_coords = _douglas_peucker(road_coords, 15.0)
+                polylines = [_douglas_peucker(road_coords, 15.0)]
             elif detail == "simple":
                 pts_chain = ([r["start"]] if r.get("start") else []) + r.get("houses", [])
-                road_coords = [ll for ll in pts_chain if ll]
+                polylines = [[ll for ll in pts_chain if ll]]
+            elif detail in ("major", "most"):
+                polylines = _filter_segments_by_priority(
+                    road_segments, DETAIL_PRIORITY_THRESHOLDS[detail])
+                if not polylines and road_coords:
+                    polylines = [road_coords]
+            else:
+                polylines = [road_coords] if road_coords else []
 
-            if len(road_coords) >= 2:
-                folium.PolyLine(
-                    locations=road_coords,
-                    color=color, weight=3.5, opacity=0.85,
-                    tooltip=f"{team_name} — {len(r['houses'])} houses",
-                ).add_to(m)
-                _add_route_arrows(m, road_coords, color)
+            for pl in polylines:
+                if len(pl) >= 2:
+                    folium.PolyLine(
+                        locations=pl,
+                        color=color, weight=3.5, opacity=0.85,
+                        tooltip=f"{team_name} — {len(r['houses'])} houses",
+                    ).add_to(m)
+                    _add_route_arrows(m, pl, color)
 
             if r["start"]:
                 ci = r.get("car_idx", 0)
