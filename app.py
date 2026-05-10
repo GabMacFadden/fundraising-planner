@@ -43,19 +43,17 @@ WALKABLE_HIGHWAYS = (
     "tertiary|tertiary_link|secondary|secondary_link|primary|"
     "primary_link|unclassified|cycleway|steps"
 )
-# 12 visually distinct colours for up to 10 teams (modulo-wrapped if needed)
 TEAM_COLORS = [
     "#e74c3c", "#3498db", "#2ecc71", "#f39c12",
     "#9b59b6", "#1abc9c", "#e67e22", "#34495e",
     "#e91e63", "#795548", "#00bcd4", "#8bc34a",
 ]
-# Colour per car (green=1st, blue=2nd, purple=3rd)
 CAR_MARKER_COLORS = ["green", "blue", "purple"]
 
 WALKING_SPEED_KMH = 4.0
 EMPTY_HOUSE_RATE  = 0.35
 EMPTY_DOOR_SEC    = 20
-MAX_END_DIST_M    = 1_000   # ~15 min @ 4 km/h
+MAX_END_DIST_M    = 1_000
 
 HIGHWAY_PRIORITY = {
     "residential": 10, "living_street": 10, "unclassified": 8,
@@ -67,34 +65,38 @@ HIGHWAY_PRIORITY = {
 HOUSE_SNAP_M = 40.0
 
 DEFAULTS = {
-    "stage":               "setup",
-    "center_latlng":       None,
-    "transport":           "car",
-    "n_people":            2,
-    "n_cars":              1,
-    "shift_hours":         4.0,
-    "time_per_door":       3.0,
-    "same_start":          True,
-    "team_starts":         [],
-    "selected_parking":    None,      # alias → car_parkings[selecting_car]
-    "selected_parking_id": None,      # alias → car_park_ids[selecting_car]
-    "car_parkings":        [],        # [[lat,lon], ...] one per car
-    "car_park_ids":        [],        # ["park_N", ...] one per car
-    "selecting_car":       0,         # active car tab (0-based)
-    "parking_spots":       [],
-    "map_mode":            "area",
-    "manual_end":          None,
-    "map_bounds":          None,
-    "street_ways":         [],
-    "polygon":             None,
-    "buildings":           [],
-    "transit_stops":       [],
-    "fetch_done":          False,
-    "routes":              [],
-    "routes_done":         False,
-    "map_key":             0,
-    "reset_polygon_wkt":   None,
-    "last_click_seen":     None,
+    "stage":                 "setup",
+    "center_latlng":         None,
+    "transport":             "car",
+    "n_people":              2,
+    "n_cars":                1,
+    "shift_hours":           4.0,
+    "time_per_door":         3.0,
+    "same_start":            True,
+    "team_starts":           [],
+    "selected_parking":      None,
+    "selected_parking_id":   None,
+    "car_parkings":          [],
+    "car_park_ids":          [],
+    "selecting_car":         0,
+    "parking_spots":         [],
+    "map_mode":              "area",
+    "manual_end":            None,
+    "map_bounds":            None,
+    "street_ways":           [],
+    "polygon":               None,
+    "buildings":             [],
+    "transit_stops":         [],
+    "fetch_done":            False,
+    "routes":                [],
+    "routes_done":           False,
+    "map_key":               0,
+    "reset_polygon_wkt":     None,
+    "last_click_seen":       None,
+    "isolation_threshold_m": 0,
+    "route_detail":          "full",
+    "show_legend":           True,
+    "show_parking_markers":  False,
 }
 
 
@@ -127,7 +129,6 @@ def lighten(hex_color: str, factor: float = 0.5) -> str:
 
 
 def geocode_address(address: str):
-    """Nominatim → [lat, lon] or None."""
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
@@ -144,7 +145,6 @@ def geocode_address(address: str):
 
 
 def dist_point_to_segment_m(pt, seg_a, seg_b) -> float:
-    """Flat-earth perpendicular distance in metres, clamped to segment."""
     lat0    = (pt[0] + seg_a[0] + seg_b[0]) / 3.0
     cos_lat = math.cos(math.radians(lat0))
     def _m(p):
@@ -159,7 +159,6 @@ def dist_point_to_segment_m(pt, seg_a, seg_b) -> float:
 
 
 def _bearing(p1, p2) -> float:
-    """Compass bearing in degrees from p1 to p2 (0 = north, clockwise)."""
     lat1 = math.radians(p1[0]); lat2 = math.radians(p2[0])
     dlon = math.radians(p2[1] - p1[1])
     x = math.sin(dlon) * math.cos(lat2)
@@ -169,7 +168,6 @@ def _bearing(p1, p2) -> float:
 
 
 def _add_route_arrows(m, coords: list, color: str, step_m: float = 120.0):
-    """Overlay rotated CSS-triangle direction markers every step_m metres."""
     if len(coords) < 2:
         return
     accum = step_m / 2.0
@@ -201,6 +199,35 @@ def _add_route_arrows(m, coords: list, color: str, step_m: float = 120.0):
         accum -= seg
 
 
+def _douglas_peucker(coords: list, epsilon_m: float) -> list:
+    if len(coords) <= 2:
+        return coords
+    max_d, max_i = 0.0, 0
+    for i in range(1, len(coords) - 1):
+        d = dist_point_to_segment_m(coords[i], coords[0], coords[-1])
+        if d > max_d:
+            max_d, max_i = d, i
+    if max_d > epsilon_m:
+        return (
+            _douglas_peucker(coords[:max_i + 1], epsilon_m)[:-1]
+            + _douglas_peucker(coords[max_i:], epsilon_m)
+        )
+    return [coords[0], coords[-1]]
+
+
+def _filter_isolated(buildings: list, threshold_m: float) -> list:
+    """Remove buildings whose nearest neighbour is farther than threshold_m."""
+    if not buildings or threshold_m <= 0:
+        return buildings
+    pts = [[b["lat"], b["lon"]] for b in buildings]
+    kept = [
+        b for i, b in enumerate(buildings)
+        if any(haversine_m(pts[i], pts[j]) <= threshold_m
+               for j in range(len(pts)) if j != i)
+    ]
+    return kept if kept else buildings
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # OVERPASS QUERIES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -220,7 +247,6 @@ def _post_overpass(query: str):
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=50)
 def fetch_parking_near(lat: float, lon: float, radius_m: int = 900):
-    """Free parking spots within radius_m of a point."""
     deg = radius_m / 111_320
     s, w, n, e = lat - deg, lon - deg, lat + deg, lon + deg
     query = f"""
@@ -256,7 +282,6 @@ out geom tags;
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=50)
 def fetch_parking_in_bounds(s: float, w: float, n: float, e: float) -> list:
-    """Parking, schools and kindergartens in the visible map bbox."""
     query = f"""
 [out:json][timeout:30];
 (
@@ -302,7 +327,6 @@ out geom tags;
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
 def fetch_all(polygon_wkt: str) -> dict:
-    """Buildings, transit stops and street ways inside polygon."""
     polygon = shapely_wkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = polygon.bounds
     s, w, n, e = miny, minx, maxy, maxx
@@ -477,7 +501,6 @@ def _route_dist(wps: list) -> float:
 
 
 def _split_left_right(buildings: list):
-    """Split buildings into two halves along the cluster's primary axis."""
     lats = [b["lat"] for b in buildings]
     lons = [b["lon"] for b in buildings]
     clat = sum(lats) / len(lats)
@@ -496,7 +519,6 @@ def _split_left_right(buildings: list):
 
 
 def compute_contour(buildings: list):
-    """[[lat, lon], ...] convex-hull polygon of the team's buildings."""
     if len(buildings) < 3:
         return None
     try:
@@ -511,7 +533,6 @@ def compute_contour(buildings: list):
 # ── Street graph (RPP) ────────────────────────────────────────────────────────
 
 def build_street_graph(street_ways: list) -> dict:
-    """Build undirected adjacency graph. Node ID = (round(lat,5), round(lon,5))."""
     graph = {}
     for way in street_ways:
         coords = way["coords"]
@@ -532,7 +553,6 @@ def build_street_graph(street_ways: list) -> dict:
 
 
 def assign_buildings_to_edges(buildings: list, street_ways: list) -> dict:
-    """Map each building to its nearest street edge → required_edges dict."""
     required_edges: dict = {}
     for bld in buildings:
         bpt = [bld["lat"], bld["lon"]]
@@ -557,7 +577,6 @@ def assign_buildings_to_edges(buildings: list, street_ways: list) -> dict:
 
 
 def dijkstra(graph: dict, source) -> tuple:
-    """Standard Dijkstra. Returns (dist, prev) dicts."""
     dist = {source: 0.0}
     prev: dict = {}
     pq = [(0.0, source)]
@@ -575,7 +594,6 @@ def dijkstra(graph: dict, source) -> tuple:
 
 
 def rural_postman_path(graph: dict, required_edges: dict, start_node) -> list:
-    """Rural Postman Problem walk covering all required_edges. Returns [node_id,...]."""
     if not required_edges:
         return [start_node] if start_node in graph else []
 
@@ -725,7 +743,6 @@ def rural_postman_path(graph: dict, required_edges: dict, start_node) -> list:
 
 
 def route_to_coords(node_walk: list, graph: dict) -> list:
-    """Convert a node-ID walk to [[lat,lon],...] using graph edge geometry."""
     if not node_walk:
         return []
     first = graph.get(node_walk[0], {})
@@ -745,7 +762,6 @@ def route_to_coords(node_walk: list, graph: dict) -> list:
 
 def plan_team_route(buildings: list, street_ways: list, graph: dict,
                     start_ll) -> dict:
-    """Road-following RPP route for one team. Returns dict with road_coords."""
     empty = {
         "road_coords": [], "left_count": None, "right_count": None,
         "contour": compute_contour(buildings), "dist_m": 0.0,
@@ -811,7 +827,8 @@ def plan_team_route(buildings: list, street_ways: list, graph: dict,
 
 def plan_routes(buildings, car_parkings, transit_stops, team_starts,
                 n_people, shift_minutes, time_per_door, transport,
-                street_ways=None, manual_end=None, n_cars=1, coverage=0.90) -> list:
+                street_ways=None, manual_end=None, n_cars=1, coverage=0.90,
+                isolation_threshold_m=0) -> list:
 
     if not buildings:
         return []
@@ -819,17 +836,20 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
     target_n  = max(1, round(len(buildings) * coverage))
     buildings = buildings[:target_n]
 
+    if isolation_threshold_m > 0:
+        buildings = _filter_isolated(buildings, isolation_threshold_m)
+        if not buildings:
+            return []
+
     pts = [[b["lat"], b["lon"]] for b in buildings]
 
-    # Normalise car_parkings — filter out None entries
-    valid_parks = [p for p in (car_parkings or []) if p is not None]
+    valid_parks  = [p for p in (car_parkings or []) if p is not None]
     primary_parking = valid_parks[0] if valid_parks else None
 
     break_min = compute_break_minutes(shift_minutes)
     net_min   = shift_minutes - break_min
     graph     = build_street_graph(street_ways or [])
 
-    # ── Two-level clustering for multi-car ────────────────────────────────────
     n_valid_cars = min(n_cars, max(1, len(valid_parks))) if n_cars > 1 else 1
 
     if n_valid_cars > 1:
@@ -848,7 +868,6 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
             continue
         park_ll = valid_parks[ci] if ci < len(valid_parks) else primary_parking
 
-        # People / teams for this car (distribute as evenly as possible)
         ppc       = n_people // n_valid_cars + (1 if ci < n_people % n_valid_cars else 0)
         car_sizes = team_compositions(max(1, ppc))
         car_n_t   = len(car_sizes)
@@ -856,7 +875,6 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
         c_pts_all  = [pts[i]       for i in bld_idxs]
         c_blds_all = [buildings[i] for i in bld_idxs]
 
-        # Level-2 cluster this car's buildings into car_n_t teams
         if car_n_t > 1 and len(c_pts_all) >= car_n_t:
             sub_clusters = _kmeans(c_pts_all, car_n_t)
             sub_clusters = _balance(c_pts_all, sub_clusters)
@@ -872,7 +890,6 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
             c_pts  = [c_pts_all[i]  for i in sub_idxs]
             c_blds = [c_blds_all[i] for i in sub_idxs]
 
-            # Resolve start for this team
             if team_starts:
                 if st.session_state.same_start or len(team_starts) == 1:
                     start_ll = team_starts[0]
@@ -935,7 +952,6 @@ def plan_routes(buildings, car_parkings, transit_stops, team_starts,
 
 def _resolve_end(ordered_pts, transit_stops, start_ll, parking_spot, transport,
                  manual_end=None):
-    """Pick the best end-point for a team based on transport mode."""
     if not ordered_pts:
         return None, "—", "none"
 
@@ -993,7 +1009,7 @@ st.markdown("""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE: SETUP  (full-width, no map)
+# STAGE: SETUP
 # ══════════════════════════════════════════════════════════════════════════════
 
 if st.session_state.stage == "setup":
@@ -1011,7 +1027,6 @@ if st.session_state.stage == "setup":
     with left:
         with st.form("setup_form"):
 
-            # ── Transport ─────────────────────────────────────────────────────
             st.subheader("🚗 Transport")
             transport = st.radio(
                 "How is your team getting there?",
@@ -1035,7 +1050,6 @@ if st.session_state.stage == "setup":
                     horizontal=True,
                 )
 
-            # ── Team ──────────────────────────────────────────────────────────
             st.subheader("👥 Team")
             n_people = st.slider(
                 "Total people in the field today",
@@ -1059,7 +1073,6 @@ if st.session_state.stage == "setup":
                     value=st.session_state.same_start,
                 )
 
-            # ── Shift ─────────────────────────────────────────────────────────
             st.subheader("⏱️ Shift")
             shift_hours = st.slider(
                 "Shift duration (hours)",
@@ -1073,7 +1086,6 @@ if st.session_state.stage == "setup":
                 f"**{shift_min - brk} min active**"
             )
 
-            # ── Doors ─────────────────────────────────────────────────────────
             st.subheader("🚪 Doors")
             time_per_door = st.slider(
                 "Average time per answered door (min)",
@@ -1085,6 +1097,24 @@ if st.session_state.stage == "setup":
                 ),
             )
 
+            with st.expander("⚙️ Advanced options", expanded=False):
+                isolation_threshold_m = st.slider(
+                    "Ignore isolated houses — nearest-neighbour threshold (m)",
+                    min_value=0, max_value=500,
+                    value=st.session_state.isolation_threshold_m,
+                    step=10,
+                    help=(
+                        "Houses whose nearest neighbour is farther than this "
+                        "distance will be excluded from route planning. "
+                        "0 = include all houses."
+                    ),
+                )
+                if isolation_threshold_m > 0:
+                    st.caption(
+                        f"Houses more than {isolation_threshold_m} m from any "
+                        "neighbour will be skipped."
+                    )
+
             submitted = st.form_submit_button(
                 "Continue to map →", type="primary", use_container_width=True
             )
@@ -1093,7 +1123,7 @@ if st.session_state.stage == "setup":
         st.markdown("#### How it works")
         st.markdown("""
 1. **Fill in the form** on the left and click *Continue*.
-2. The map opens. Use the **search box** (top-left) to navigate to your area.
+2. The map opens. Use the **search box** (top-left 🔍) to navigate to your area.
    - 🚗 **Car mode** — set parking for each car, then draw your area.
    - 🚶 **Walk mode** — click **Set start** then drop a marker on the map.
 3. **Draw your work area** with the rectangle or polygon tool.
@@ -1103,6 +1133,7 @@ if st.session_state.stage == "setup":
    - a **road-following path** with **direction arrows**
    - a left/right house count (2-person teams)
    - estimated walk time, talk time and break schedule
+   - an expandable **street-by-street plan** for briefing volunteers
 """)
         with st.expander("⚠️ Disclaimer", expanded=False):
             st.warning(
@@ -1119,30 +1150,34 @@ if st.session_state.stage == "setup":
 
     if submitted:
         st.session_state.update(
-            transport           = transport,
-            n_people            = n_people,
-            n_cars              = n_cars,
-            same_start          = same_start,
-            shift_hours         = shift_hours,
-            time_per_door       = time_per_door,
-            car_parkings        = [],
-            car_park_ids        = [],
-            selecting_car       = 0,
-            parking_spots       = [],
-            selected_parking    = None,
-            selected_parking_id = None,
-            team_starts         = [],
-            polygon             = None,
-            buildings           = [],
-            transit_stops       = [],
-            fetch_done          = False,
-            routes              = [],
-            routes_done         = False,
-            last_click_seen     = None,
-            map_mode            = "area",
-            manual_end          = None,
-            street_ways         = [],
-            stage               = "map",
+            transport              = transport,
+            n_people               = n_people,
+            n_cars                 = n_cars,
+            same_start             = same_start,
+            shift_hours            = shift_hours,
+            time_per_door          = time_per_door,
+            isolation_threshold_m  = isolation_threshold_m,
+            car_parkings           = [],
+            car_park_ids           = [],
+            selecting_car          = 0,
+            parking_spots          = [],
+            selected_parking       = None,
+            selected_parking_id    = None,
+            show_parking_markers   = False,
+            team_starts            = [],
+            polygon                = None,
+            buildings              = [],
+            transit_stops          = [],
+            fetch_done             = False,
+            routes                 = [],
+            routes_done            = False,
+            last_click_seen        = None,
+            map_mode               = "area",
+            manual_end             = None,
+            street_ways            = [],
+            route_detail           = "full",
+            show_legend            = True,
+            stage                  = "map",
         )
         st.rerun()
 
@@ -1150,7 +1185,7 @@ if st.session_state.stage == "setup":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE: MAP  (map + control panel)
+# STAGE: MAP
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.markdown('<p class="main-title">🗺️ Fundraising Route Planner</p>',
@@ -1163,7 +1198,6 @@ st.markdown(
 
 map_col, ctrl_col = st.columns([3, 1])
 
-# ── Derived convenience vars ───────────────────────────────────────────────────
 transport = st.session_state.transport
 n_people  = st.session_state.n_people
 n_cars    = st.session_state.n_cars
@@ -1180,7 +1214,6 @@ map_mode  = st.session_state.map_mode
 
 with ctrl_col:
 
-    # Session summary + back button
     st.caption(
         f"{'🚗' if transport == 'car' else '🚶'} · "
         f"{n_people} people · {n_t} team{'s' if n_t > 1 else ''}"
@@ -1200,7 +1233,6 @@ with ctrl_col:
         st.markdown('<p class="step-label">🅿️ Step 1 — Confirm parking</p>',
                     unsafe_allow_html=True)
 
-        # One tab per car (single car: no tab chrome)
         if n_cars > 1:
             car_tab_objs = st.tabs([f"🚗 Car {i + 1}" for i in range(n_cars)])
         else:
@@ -1208,7 +1240,6 @@ with ctrl_col:
 
         for ci, tab in enumerate(car_tab_objs):
             with tab:
-                # Sync aliases when this car's tab is the active one
                 if st.session_state.selecting_car == ci:
                     _sel    = (st.session_state.car_parkings[ci]
                                if ci < len(st.session_state.car_parkings) else None)
@@ -1235,15 +1266,16 @@ with ctrl_col:
                              key=f"find_pk_{ci}",
                              disabled=not bounds_ready,
                              use_container_width=True):
-                    b = st.session_state.map_bounds
-                    spots = fetch_parking_in_bounds(
-                        b["_southWest"]["lat"], b["_southWest"]["lng"],
-                        b["_northEast"]["lat"], b["_northEast"]["lng"],
-                    )
+                    with st.spinner("Searching for parking spots…"):
+                        b = st.session_state.map_bounds
+                        spots = fetch_parking_in_bounds(
+                            b["_southWest"]["lat"], b["_southWest"]["lng"],
+                            b["_northEast"]["lat"], b["_northEast"]["lng"],
+                        )
                     st.session_state.parking_spots       = spots
                     st.session_state.selected_parking_id = None
                     st.session_state.selected_parking    = None
-                    # Clear this car's confirmed slot
+                    st.session_state.show_parking_markers = True
                     _cp = list(st.session_state.car_parkings)
                     _ci = list(st.session_state.car_park_ids)
                     while len(_cp) <= ci:
@@ -1259,34 +1291,50 @@ with ctrl_col:
                 if not bounds_ready:
                     st.caption("Pan or zoom the map first.")
 
-                # Show spots only for the active car tab
-                if st.session_state.selecting_car == ci:
-                    for sp in st.session_state.parking_spots:
-                        is_sel = (st.session_state.selected_parking_id == sp["id"])
-                        icon   = {"parking": "🅿️", "school": "🏫",
-                                  "kindergarten": "🏡"}[sp["type"]]
-                        label  = f"{'✅ ' if is_sel else ''}{icon} {sp['name']}"
-                        if st.button(label, key=f"btn_{sp['id']}", use_container_width=True):
-                            _cp = list(st.session_state.car_parkings)
-                            _ci = list(st.session_state.car_park_ids)
-                            while len(_cp) <= ci:
-                                _cp.append(None)
-                                _ci.append(None)
-                            if is_sel:
-                                _cp[ci] = None
-                                _ci[ci] = None
-                                st.session_state.selected_parking    = None
-                                st.session_state.selected_parking_id = None
-                            else:
-                                _cp[ci] = [sp["lat"], sp["lon"]]
-                                _ci[ci] = sp["id"]
-                                st.session_state.selected_parking    = _cp[ci]
-                                st.session_state.selected_parking_id = _ci[ci]
-                            st.session_state.car_parkings = _cp
-                            st.session_state.car_park_ids = _ci
+                if st.session_state.selecting_car == ci and st.session_state.parking_spots:
+                    n_spots = len(st.session_state.parking_spots)
+
+                    col_info, col_tog = st.columns([2, 1])
+                    with col_info:
+                        st.caption(f"{n_spots} spot{'s' if n_spots != 1 else ''} found")
+                    with col_tog:
+                        show_m = st.session_state.show_parking_markers
+                        if st.button(
+                            "🗺️ Hide" if show_m else "🗺️ Show",
+                            key=f"tog_map_{ci}",
+                            use_container_width=True,
+                            help="Show or hide parking markers on the map (to avoid accidental clicks while drawing)",
+                        ):
+                            st.session_state.show_parking_markers = not show_m
+                            st.session_state.map_key += 1
                             st.rerun()
 
-                # Confirmed status for this car
+                    _icon_lbl = {"parking": "🅿️", "school": "🏫", "kindergarten": "🏡"}
+                    with st.container(height=200):
+                        for sp in st.session_state.parking_spots:
+                            is_sel = (st.session_state.selected_parking_id == sp["id"])
+                            icon   = _icon_lbl.get(sp["type"], "🅿️")
+                            label  = f"{'✅ ' if is_sel else ''}{icon} {sp['name']}"
+                            if st.button(label, key=f"btn_{sp['id']}", use_container_width=True):
+                                _cp = list(st.session_state.car_parkings)
+                                _ci = list(st.session_state.car_park_ids)
+                                while len(_cp) <= ci:
+                                    _cp.append(None)
+                                    _ci.append(None)
+                                if is_sel:
+                                    _cp[ci] = None
+                                    _ci[ci] = None
+                                    st.session_state.selected_parking    = None
+                                    st.session_state.selected_parking_id = None
+                                else:
+                                    _cp[ci] = [sp["lat"], sp["lon"]]
+                                    _ci[ci] = sp["id"]
+                                    st.session_state.selected_parking    = _cp[ci]
+                                    st.session_state.selected_parking_id = _ci[ci]
+                                st.session_state.car_parkings = _cp
+                                st.session_state.car_park_ids = _ci
+                                st.rerun()
+
                 park_for_car = (st.session_state.car_parkings[ci]
                                 if ci < len(st.session_state.car_parkings) else None)
                 if park_for_car:
@@ -1296,7 +1344,9 @@ with ctrl_col:
                              else f"✅ Car {ci + 1} parking set")
                     st.success(label)
                 else:
-                    lbl = "_No parking selected yet._" if n_cars == 1 else f"_Car {ci + 1}: no parking yet._"
+                    lbl = ("_No parking selected yet._"
+                           if n_cars == 1
+                           else f"_Car {ci + 1}: no parking yet._")
                     st.caption(lbl)
 
     else:
@@ -1410,18 +1460,19 @@ with ctrl_col:
 
                 with st.spinner(f"Planning routes for {n_t} team(s)…"):
                     routes = plan_routes(
-                        buildings      = result["buildings"],
-                        car_parkings   = st.session_state.car_parkings,
-                        transit_stops  = result.get("transit_stops", []),
-                        team_starts    = effective_starts,
-                        n_people       = n_people,
-                        shift_minutes  = int(st.session_state.shift_hours * 60),
-                        time_per_door  = st.session_state.time_per_door,
-                        transport      = transport,
-                        street_ways    = result.get("street_ways", []),
-                        manual_end     = st.session_state.get("manual_end"),
-                        n_cars         = n_cars,
-                        coverage       = 0.90,
+                        buildings              = result["buildings"],
+                        car_parkings           = st.session_state.car_parkings,
+                        transit_stops          = result.get("transit_stops", []),
+                        team_starts            = effective_starts,
+                        n_people               = n_people,
+                        shift_minutes          = int(st.session_state.shift_hours * 60),
+                        time_per_door          = st.session_state.time_per_door,
+                        transport              = transport,
+                        street_ways            = result.get("street_ways", []),
+                        manual_end             = st.session_state.get("manual_end"),
+                        n_cars                 = n_cars,
+                        coverage               = 0.90,
+                        isolation_threshold_m  = st.session_state.isolation_threshold_m,
                     )
 
                 st.session_state.routes      = routes
@@ -1476,8 +1527,45 @@ with ctrl_col:
                 unsafe_allow_html=True,
             )
 
+            with st.expander(f"📋 Team {r['team_idx'] + 1} street plan"):
+                streets: dict = {}
+                for bld in r.get("house_data", []):
+                    st_name = bld.get("name") or bld.get("street") or "Unknown street"
+                    num = bld.get("housenumber", "")
+                    streets.setdefault(st_name, []).append(num)
+                if streets:
+                    for st_name, nums in sorted(streets.items()):
+                        nums_str = ", ".join(n for n in sorted(nums) if n) or "—"
+                        st.caption(f"📍 **{st_name}**: {nums_str}")
+                else:
+                    st.caption("_No address details available._")
+
         if st.session_state.transit_stops:
             st.caption(f"🚌 {len(st.session_state.transit_stops)} transit stop(s) nearby")
+
+        st.divider()
+        st.caption("Display options")
+
+        _detail_labels = {"full": "Full roads", "medium": "Simplified", "simple": "Waypoints only"}
+        _detail_opts   = list(_detail_labels.keys())
+        current_detail = st.session_state.get("route_detail", "full")
+        new_detail = st.radio(
+            "Route detail",
+            options=_detail_opts,
+            format_func=lambda x: _detail_labels[x],
+            index=_detail_opts.index(current_detail),
+            horizontal=True,
+        )
+        if new_detail != current_detail:
+            st.session_state.route_detail = new_detail
+            st.session_state.map_key += 1
+            st.rerun()
+
+        leg_lbl = "🗺️ Hide legend" if st.session_state.show_legend else "🗺️ Show legend"
+        if st.button(leg_lbl, use_container_width=True):
+            st.session_state.show_legend = not st.session_state.show_legend
+            st.session_state.map_key += 1
+            st.rerun()
 
     # ── Stats & reset ──────────────────────────────────────────────────────────
 
@@ -1490,23 +1578,25 @@ with ctrl_col:
         if st.button("🔄 Reset area & routes", use_container_width=True):
             old_wkt = polygon.wkt if polygon else None
             st.session_state.update(
-                polygon             = None,
-                buildings           = [],
-                transit_stops       = [],
-                fetch_done          = False,
-                routes              = [],
-                routes_done         = False,
-                map_key             = st.session_state.map_key + 1,
-                reset_polygon_wkt   = old_wkt,
-                street_ways         = [],
-                map_mode            = "area",
-                manual_end          = None,
-                car_parkings        = [],
-                car_park_ids        = [],
-                selecting_car       = 0,
-                parking_spots       = [],
-                selected_parking    = None,
-                selected_parking_id = None,
+                polygon              = None,
+                buildings            = [],
+                transit_stops        = [],
+                fetch_done           = False,
+                routes               = [],
+                routes_done          = False,
+                map_key              = st.session_state.map_key + 1,
+                reset_polygon_wkt    = old_wkt,
+                street_ways          = [],
+                map_mode             = "area",
+                manual_end           = None,
+                car_parkings         = [],
+                car_park_ids         = [],
+                selecting_car        = 0,
+                parking_spots        = [],
+                selected_parking     = None,
+                selected_parking_id  = None,
+                show_parking_markers = False,
+                show_legend          = True,
             )
             st.rerun()
 
@@ -1535,7 +1625,6 @@ with map_col:
         minx, miny, maxx, maxy = polygon.bounds
         m.fit_bounds([[miny, minx], [maxy, maxx]])
 
-    # Draw plugin — mode-dependent options
     if map_mode in ("set_start", "set_end"):
         draw_opts = {
             "polygon": False, "rectangle": False, "marker": True,
@@ -1550,9 +1639,8 @@ with map_col:
          edit_options={"edit": False, "remove": True}).add_to(m)
 
     MeasureControl(position="bottomleft", primary_length_unit="meters").add_to(m)
-    Geocoder(position="topleft", collapsed=False, add_marker=True).add_to(m)
+    Geocoder(position="topleft", collapsed=True, add_marker=True).add_to(m)
 
-    # Instruction overlay when placing a marker
     if map_mode in ("set_start", "set_end"):
         msg = ("📍 Drop a marker for the <b>start point</b>"
                if map_mode == "set_start"
@@ -1565,11 +1653,10 @@ with map_col:
           {msg}
         </div>"""))
 
-    # ── Pre-route: parking / start markers ────────────────────────────────────
+    # ── Pre-route markers ──────────────────────────────────────────────────────
 
     if not st.session_state.routes_done:
         if transport == "car":
-            # Confirmed car parking spots (one per car)
             for ci, park_ll in enumerate(st.session_state.car_parkings):
                 if park_ll:
                     folium.Marker(
@@ -1581,19 +1668,19 @@ with map_col:
                         ),
                     ).add_to(m)
 
-            # Candidate parking spots for the active car tab
-            icon_map = {"parking": "car", "school": "graduation-cap",
-                        "kindergarten": "child"}
-            for sp in st.session_state.parking_spots:
-                is_sel = (st.session_state.selected_parking_id == sp["id"])
-                folium.Marker(
-                    location=[sp["lat"], sp["lon"]],
-                    tooltip=sp["id"],
-                    icon=folium.Icon(
-                        color="green" if is_sel else "gray",
-                        icon=icon_map.get(sp["type"], "car"), prefix="fa",
-                    ),
-                ).add_to(m)
+            if st.session_state.show_parking_markers:
+                _fa_icon = {"parking": "car", "school": "graduation-cap",
+                            "kindergarten": "child"}
+                for sp in st.session_state.parking_spots:
+                    is_sel = (st.session_state.selected_parking_id == sp["id"])
+                    folium.Marker(
+                        location=[sp["lat"], sp["lon"]],
+                        tooltip=sp["id"],
+                        icon=folium.Icon(
+                            color="green" if is_sel else "gray",
+                            icon=_fa_icon.get(sp["type"], "car"), prefix="fa",
+                        ),
+                    ).add_to(m)
         else:
             for i, s in enumerate(st.session_state.team_starts):
                 lbl = ("All teams"
@@ -1613,6 +1700,8 @@ with map_col:
     # ── Route layers ──────────────────────────────────────────────────────────
 
     if st.session_state.routes_done and st.session_state.routes:
+        detail = st.session_state.get("route_detail", "full")
+
         for r in st.session_state.routes:
             color     = r["color"]
             team_name = f"Team {r['team_idx'] + 1}"
@@ -1626,6 +1715,12 @@ with map_col:
                 ).add_to(m)
 
             road_coords = r.get("road_coords", [])
+            if detail == "medium" and len(road_coords) > 2:
+                road_coords = _douglas_peucker(road_coords, 15.0)
+            elif detail == "simple":
+                pts_chain = ([r["start"]] if r.get("start") else []) + r.get("houses", [])
+                road_coords = [ll for ll in pts_chain if ll]
+
             if len(road_coords) >= 2:
                 folium.PolyLine(
                     locations=road_coords,
@@ -1664,7 +1759,9 @@ with map_col:
 
     # ── Legend ─────────────────────────────────────────────────────────────────
 
-    if st.session_state.routes_done and st.session_state.routes:
+    if (st.session_state.routes_done
+            and st.session_state.routes
+            and st.session_state.show_legend):
         rows = ""
         for r in st.session_state.routes:
             c = r["color"]
@@ -1707,11 +1804,9 @@ with map_col:
 
     if map_out:
 
-        # Store bounds (needed for parking button)
         if map_out.get("bounds"):
             st.session_state.map_bounds = map_out["bounds"]
 
-        # Geocoder result → re-centre map
         geo = map_out.get("last_geocoder_result")
         if geo:
             try:
@@ -1724,10 +1819,11 @@ with map_col:
             except Exception:
                 pass
 
-        # Parking marker click via tooltip
         tooltip_clicked = map_out.get("last_object_clicked_tooltip")
-        if (tooltip_clicked and str(tooltip_clicked).startswith("park_")
-                and not st.session_state.routes_done):
+        if (tooltip_clicked
+                and str(tooltip_clicked).startswith("park_")
+                and not st.session_state.routes_done
+                and st.session_state.show_parking_markers):
             spot_id = str(tooltip_clicked)
             ci      = st.session_state.selecting_car
             _cp = list(st.session_state.car_parkings)
@@ -1752,12 +1848,11 @@ with map_col:
             st.session_state.car_park_ids = _ci
             st.rerun()
 
-        # Drawing: Point (start/end placement) or Polygon (area)
         drawing   = map_out.get("last_active_drawing")
         geom_type = drawing.get("geometry", {}).get("type", "") if drawing else ""
 
         if geom_type == "Point" and map_mode in ("set_start", "set_end"):
-            coords = drawing["geometry"]["coordinates"]  # [lon, lat]
+            coords = drawing["geometry"]["coordinates"]
             ll = [coords[1], coords[0]]
             if map_mode == "set_start":
                 n_needed = 1 if st.session_state.same_start else n_t
